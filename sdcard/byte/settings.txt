@@ -1,0 +1,4 @@
+# Himop settings. Edit these, then put the card in the ESP32 slot above the USB port.
+name=Himop
+hold_ms=2800
+description=It may be 12 feet 6 inches tall, but it easily flies, too.

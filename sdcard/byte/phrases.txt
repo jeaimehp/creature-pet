@@ -1,0 +1,21 @@
+# One short kind line per row. Blank lines and rows starting with # are skipped.
+you matter
+nice work
+hello friend
+you got this
+so proud
+be kind
+good day
+you rock
+stay curious
+i like you
+high five
+shine on
+all is well
+you belong
+keep going
+way to go
+have fun
+you are enough
+good luck
+proud of you

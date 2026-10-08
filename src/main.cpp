@@ -1,0 +1,913 @@
+#include "himop_art.h"
+#include "lgfx_board.hpp"
+#include "sd_store.h"
+#include "weather.h"
+
+#include <math.h>
+#include <string.h>
+
+static LGFX display;
+static LGFX_Sprite canvas(&display);
+
+static constexpr int W = 480;
+static constexpr int H = 480;
+static constexpr int kMinX = 150;
+static constexpr int kMaxX = 330;
+static constexpr int kMinY = 200;
+static constexpr int kMaxY = 290;
+
+static int himopCrownX = 240;
+static int himopCrownY = 90;
+static HimopCardFrame cardFrames[18];
+static bool haveCardSprites = false;
+static uint16_t *dayBg[4] = {};
+static bool haveBackgrounds = false;
+static int himopSpriteH = 220;
+
+static uint32_t rngState = 0xC0FFEE01;
+
+static uint32_t rnd() {
+  rngState ^= rngState << 13;
+  rngState ^= rngState >> 17;
+  rngState ^= rngState << 5;
+  return rngState;
+}
+
+static int rndRange(int lo, int hi) {
+  if (hi <= lo) return lo;
+  return lo + (int)(rnd() % (uint32_t)(hi - lo + 1));
+}
+
+static int clampi(int v, int lo, int hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+enum Face : uint8_t {
+  kNeutral,
+  kHappy,
+  kSleepy,
+  kSurprise,
+  kWink,
+  kSmirk,
+  kDizzy,
+  kLove,
+  kGrumpy,
+  kSilly,
+  kThink,
+  kExcited,
+  kGlitch
+};
+
+enum Action : uint8_t {
+  kIdle,
+  kWander,
+  kHop,
+  kWiggle,
+  kPeek,
+  kSpin,
+  kDance,
+  kYawn,
+  kGlitchAct,
+  kFly,
+  kGraze,
+  kFlee
+};
+
+enum EyeStyle : uint8_t {
+  kEyeOpen,
+  kEyeHappy,
+  kEyeSleepy,
+  kEyeShut,
+  kEyeDizzy,
+  kEyeLove,
+  kEyeWide
+};
+
+struct Mote {
+  float x, y, vy;
+  uint8_t life;
+  uint8_t kind;  // 0 ambient spark, 1 heart
+};
+
+static constexpr int kMotes = 28;
+static Mote motes[kMotes];
+
+struct Motion {
+  float x, y;
+  float tx, ty;
+  float anchorX, anchorY;
+  uint8_t action;
+  uint8_t face;
+  uint32_t until;
+  bool winkLeft;
+  const char *caption;
+};
+
+static Motion buddy;
+
+static const char *kKindWords[] = {
+    "you matter",    "nice work",      "hello friend", "you got this",
+    "so proud",      "be kind",        "good day",     "you rock",
+    "stay curious",  "i like you",     "high five",    "shine on",
+    "all is well",   "you belong",     "keep going",   "way to go",
+    "have fun",      "you are enough", "good luck",    "proud of you",
+};
+static const char *kPetWords[] = {
+    "that was nice", "yay a pet", "more please", "you are the best", "i like this",
+};
+
+struct Speech {
+  const char *text;
+  uint32_t until;
+  bool visible;
+};
+
+static Speech speech;
+static int kookerX = -80;
+static uint32_t kookerUntil = 0;
+static char petName[16] = "Himop";
+static char petDescription[96] = "It may be 12 feet 6 inches tall, but it easily flies, too.";
+static uint32_t reactionMs = 2800;
+static const char **kindLines = nullptr;
+static int kindCount = 0;
+static const char *petLinePtrs[12];
+static int petLineCount = 0;
+static char phraseStore[24][32];
+static char petStore[12][32];
+static const char *phrasePtrs[24];
+static uint32_t lastPetMs = 0;
+static uint32_t bootMs = 0;
+static bool seenTouch = false;
+
+static bool isHappy(uint32_t now) {
+  return seenTouch && (now - lastPetMs) < 3200;
+}
+
+static bool isSleepy(uint32_t now) {
+  if (isHappy(now)) return false;
+  uint32_t idle = seenTouch ? (now - lastPetMs) : (now - bootMs);
+  return idle > 22000;
+}
+
+static void spawnSpark(Mote &m) {
+  m.kind = 0;
+  m.x = (float)rndRange(16, W - 16);
+  m.y = (float)rndRange(8, H - 8);
+  m.vy = 0.15f + (rnd() % 40) / 80.0f;
+  m.life = (uint8_t)rndRange(40, 140);
+}
+
+static void spawnHeart(Mote &m, float originX, float originY) {
+  m.kind = 1;
+  m.x = originX + (float)rndRange(-40, 40);
+  m.y = originY + (float)rndRange(-20, 16);
+  m.vy = -(0.7f + (rnd() % 50) / 80.0f);
+  m.life = (uint8_t)rndRange(40, 70);
+}
+
+static void drawHeart(int x, int y, int s, uint16_t color) {
+  canvas.fillCircle(x - s, y, s, color);
+  canvas.fillCircle(x + s, y, s, color);
+  canvas.fillTriangle(x - s * 2, y + s / 2, x + s * 2, y + s / 2, x, y + s * 3, color);
+}
+
+static void drawSmile(int cx, int cy, int w, int depth, uint16_t color, int thick) {
+  int prevX = cx - w;
+  int prevY = cy;
+  for (int i = 1; i <= 14; ++i) {
+    float t = (i / 14.0f) * 2.0f - 1.0f;
+    int x = cx + (int)(t * w);
+    int y = cy + (int)((1.0f - t * t) * depth);
+    canvas.drawWideLine(prevX, prevY, x, y, (float)thick, color);
+    prevX = x;
+    prevY = y;
+  }
+}
+
+static void drawEye(int cx, int cy, float open, int lookX, int lookY, EyeStyle style) {
+  const uint16_t glow = canvas.color565(18, 90, 110);
+  const uint16_t iris = canvas.color565(120, 245, 255);
+  const uint16_t pupil = canvas.color565(6, 16, 32);
+  const uint16_t shine = canvas.color565(240, 255, 255);
+  const uint16_t pink = canvas.color565(255, 90, 160);
+
+  if (style == kEyeHappy) {
+    canvas.drawWideLine(cx - 26, cy + 8, cx - 2, cy - 16, 4, iris);
+    canvas.drawWideLine(cx - 2, cy - 16, cx + 22, cy + 10, 4, iris);
+    canvas.fillCircle(cx + 16, cy + 4, 3, shine);
+    return;
+  }
+  if (style == kEyeShut) {
+    canvas.fillRoundRect(cx - 28, cy - 3, 56, 6, 3, iris);
+    return;
+  }
+  if (style == kEyeDizzy) {
+    canvas.fillEllipse(cx, cy, 30, 28, glow);
+    canvas.drawWideLine(cx - 16, cy - 14, cx + 16, cy + 14, 3, iris);
+    canvas.drawWideLine(cx - 16, cy + 14, cx + 16, cy - 14, 3, iris);
+    return;
+  }
+  if (style == kEyeLove) {
+    drawHeart(cx, cy + 2, 9, pink);
+    canvas.fillCircle(cx - 4, cy - 4, 2, shine);
+    return;
+  }
+
+  float o = open;
+  if (style == kEyeSleepy) o *= 0.28f;
+  if (style == kEyeWide) o = 1.15f;
+  if (o < 0.08f) {
+    canvas.fillRoundRect(cx - 28, cy - 3, 56, 6, 3, iris);
+    return;
+  }
+
+  int rx = (style == kEyeWide) ? 36 : 30;
+  int eh = (int)(38.0f * o);
+  if (eh < 4) eh = 4;
+  canvas.fillEllipse(cx, cy, rx + 6, eh + 8, glow);
+  canvas.fillEllipse(cx, cy, rx, eh, iris);
+
+  int px = cx + lookX;
+  int py = cy + (int)(lookY * fminf(o, 1.0f));
+  int pr = (int)((style == kEyeWide ? 8 : 12) * fminf(o, 1.0f));
+  if (pr < 3) pr = 3;
+  canvas.fillCircle(px, py + 2, pr, pupil);
+  canvas.fillCircle(px - 4, py - (int)(5 * fminf(o, 1.0f)), 3, shine);
+}
+
+static const char *randomLine(const char **lines, int count) {
+  return lines[rndRange(0, count - 1)];
+}
+
+static void showSpeech(uint32_t now, const char *text, int holdMs) {
+  speech.text = text;
+  speech.visible = true;
+  speech.until = now + (uint32_t)holdMs;
+}
+
+static void splitTwoLines(const char *text, char *first, size_t firstLen, char *second,
+                          size_t secondLen) {
+  first[0] = '\0';
+  second[0] = '\0';
+  if (text == nullptr || text[0] == '\0') return;
+  const char *comma = strchr(text, ',');
+  if (comma != nullptr && comma[1] != '\0') {
+    size_t n = (size_t)(comma - text) + 1;
+    if (n >= firstLen) n = firstLen - 1;
+    memcpy(first, text, n);
+    first[n] = '\0';
+    const char *rest = comma + 1;
+    while (*rest == ' ') rest++;
+    strncpy(second, rest, secondLen - 1);
+    second[secondLen - 1] = '\0';
+    return;
+  }
+  strncpy(first, text, firstLen - 1);
+  first[firstLen - 1] = '\0';
+}
+
+static void rollSpeech(uint32_t now) {
+  if (now < speech.until) return;
+  speech.visible = false;
+}
+
+static const uint8_t kTouchFaces[] = {
+    kHappy, kLove, kExcited, kWink, kSilly, kSurprise, kSmirk, kDizzy, kThink, kGrumpy,
+};
+
+static const char *captionFor(uint8_t face) {
+  switch (face) {
+    case kHappy: return "affection++";
+    case kSmirk: return "heh";
+    case kThink: return "hmm";
+    case kSurprise: return "oh!";
+    case kWink: return "wink";
+    case kGrumpy: return "hmph";
+    case kSilly: return "blep";
+    case kLove: return "<3";
+    case kExcited: return "yay";
+    case kDizzy: return "wheee";
+    case kGlitch: return "bzzt";
+    case kSleepy: return "low power ...";
+    default: return "tap to pet";
+  }
+}
+
+static uint8_t nextTouchFace() {
+  const int count = (int)(sizeof(kTouchFaces) / sizeof(kTouchFaces[0]));
+  uint8_t pick = buddy.face;
+  for (int tries = 0; tries < 8; ++tries) {
+    pick = kTouchFaces[rndRange(0, count - 1)];
+    if (pick != buddy.face) break;
+  }
+  return pick;
+}
+
+static void drawLabel(const char *text, int x, int y, uint16_t color, uint8_t datum,
+                       const lgfx::GFXfont *font) {
+  canvas.setFont(font);
+  canvas.setTextDatum(datum);
+  int tw = canvas.textWidth(text);
+  int th = canvas.fontHeight();
+  int left = x;
+  if (datum == middle_center) left = x - tw / 2;
+  else if (datum == middle_right) left = x - tw;
+  canvas.fillRoundRect(left - 10, y - th / 2 - 6, tw + 20, th + 12, 12, canvas.color565(6, 10, 22));
+  canvas.setTextColor(color);
+  canvas.drawString(text, x, y);
+}
+
+static void drawSpeech(int hx, int hy) {
+  if (!speech.visible || speech.text == nullptr) return;
+
+  bool roar = speech.text[0] == 'R';
+  canvas.setFont(&fonts::FreeSansBold18pt7b);
+  canvas.setTextDatum(middle_center);
+  char line1[96];
+  char line2[96];
+  splitTwoLines(speech.text, line1, sizeof(line1), line2, sizeof(line2));
+  bool two = line2[0] != '\0' && canvas.textWidth(speech.text) > 260;
+  int tw = two ? canvas.textWidth(line1) : canvas.textWidth(speech.text);
+  if (two) {
+    int tw2 = canvas.textWidth(line2);
+    if (tw2 > tw) tw = tw2;
+  }
+  int th = canvas.fontHeight();
+  int bw = tw + 24;
+  int bh = two ? th * 2 + 18 : th + 16;
+
+  const int crownX = himopCrownX;
+  const int crownY = himopCrownY;
+
+  bool onRight = hx <= W / 2;
+  int bx = onRight ? hx + 20 : hx - bw - 20;
+  int by = crownY - bh - 16;
+  bx = clampi(bx, 6, W - bw - 6);
+  by = clampi(by, 150, crownY - bh - 8);
+
+  const uint16_t fill = roar ? canvas.color565(255, 236, 220) : canvas.color565(236, 252, 255);
+  const uint16_t edge = roar ? canvas.color565(180, 40, 36) : canvas.color565(36, 130, 160);
+  const uint16_t ink = roar ? canvas.color565(140, 16, 16) : canvas.color565(14, 40, 64);
+
+  int attachX = onRight ? bx + 18 : bx + bw - 18;
+  int attachY = by + bh - 1;
+  canvas.fillTriangle(attachX - 8, attachY, attachX + 8, attachY, crownX, crownY, fill);
+  canvas.drawWideLine(attachX - 8, attachY, crownX, crownY, 1.6f, edge);
+  canvas.drawWideLine(attachX + 8, attachY, crownX, crownY, 1.6f, edge);
+
+  canvas.fillRoundRect(bx, by, bw, bh, 12, fill);
+  canvas.drawRoundRect(bx, by, bw, bh, 12, edge);
+
+  canvas.setTextColor(ink);
+  if (two) {
+    canvas.drawString(line1, bx + bw / 2, by + 8 + th / 2);
+    canvas.drawString(line2, bx + bw / 2, by + 10 + th + th / 2);
+  } else {
+    canvas.drawString(speech.text, bx + bw / 2, by + bh / 2 + 1);
+  }
+}
+
+static void placeTarget(int x, int y) {
+  buddy.tx = (float)clampi(x, kMinX, kMaxX);
+  buddy.ty = (float)clampi(y, kMinY, kMaxY);
+}
+
+static void pickNext(uint32_t now) {
+  buddy.anchorX = buddy.x;
+  buddy.anchorY = buddy.y;
+  buddy.winkLeft = (rnd() & 1) != 0;
+
+  int roll = rndRange(0, 9);
+  uint32_t dur = 5000;
+  if (roll <= 5) {
+    buddy.action = kFly;
+    buddy.face = kNeutral;
+    buddy.caption = "soaring";
+    placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMaxY));
+    dur = (uint32_t)rndRange(4200, 7000);
+  } else if (roll <= 7) {
+    buddy.action = kYawn;
+    buddy.face = kSleepy;
+    buddy.caption = "napping";
+    placeTarget((int)buddy.x, (int)buddy.y + 10);
+    dur = (uint32_t)rndRange(5000, 9000);
+  } else if (roll == 8) {
+    buddy.action = kWander;
+    buddy.face = kNeutral;
+    buddy.caption = "on foot";
+    placeTarget(rndRange(kMinX, kMaxX), kMaxY - 8);
+    dur = (uint32_t)rndRange(2800, 4200);
+  } else if ((rnd() % 3) == 0) {
+    buddy.action = kFlee;
+    buddy.face = kSurprise;
+    buddy.caption = "kooker!";
+    bool fromLeft = buddy.x >= (kMinX + kMaxX) / 2;
+    kookerX = fromLeft ? 28 : W - 28;
+    kookerUntil = now + 2800;
+    placeTarget(fromLeft ? kMaxX : kMinX, rndRange(kMinY, kMinY + 40));
+    showSpeech(now, "ROW, ROW, ROW", 2800);
+    dur = 2800;
+  } else {
+    buddy.action = kGraze;
+    buddy.face = kNeutral;
+    buddy.caption = "nibbling";
+    placeTarget(rndRange(kMinX, kMaxX), kMaxY);
+    dur = (uint32_t)rndRange(2800, 4600);
+  }
+
+  buddy.until = now + dur;
+  Serial.printf("action %u face %u\n", buddy.action, buddy.face);
+}
+
+static void updateBuddy(uint32_t now) {
+  if (buddy.until == 0 || now >= buddy.until) pickNext(now);
+
+  if (isHappy(now)) buddy.face = kHappy;
+
+  float step = 0.0f;
+  if (buddy.action == kFly) step = 1.7f;
+  else if (buddy.action == kFlee) step = 4.0f;
+  else if (buddy.action == kGraze) step = 1.0f;
+  else if (buddy.action == kWander) step = 0.65f;
+
+  if (step > 0.0f) {
+    float dx = buddy.tx - buddy.x;
+    float dy = buddy.ty - buddy.y;
+    float dist = sqrtf(dx * dx + dy * dy);
+    if (dist > step) {
+      buddy.x += dx / dist * step;
+      buddy.y += dy / dist * step;
+    } else if (buddy.action == kFly && (buddy.until - now) > 800) {
+      placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMaxY));
+    }
+  }
+
+  buddy.x = fminf(fmaxf(buddy.x, (float)kMinX), (float)kMaxX);
+  buddy.y = fminf(fmaxf(buddy.y, (float)kMinY), (float)kMaxY);
+}
+
+static void drawFace(int hx, int hy, int lookX, int lookY, float blinkOpen, uint32_t now) {
+  const uint16_t blush = canvas.color565(255, 90, 150);
+  const uint16_t smile = canvas.color565(140, 230, 240);
+  const uint16_t pink = canvas.color565(255, 150, 190);
+  const uint16_t belly = canvas.color565(8, 18, 32);
+  const Face face = (Face)buddy.face;
+
+  int jx = 0;
+  int jy = 0;
+  if (face == kGlitch && ((now / 90) & 1)) {
+    jx = 7;
+    jy = -5;
+  }
+
+  float open = blinkOpen;
+  if (face == kSurprise || face == kExcited) open = 1.0f;
+
+  EyeStyle left = kEyeOpen;
+  EyeStyle right = kEyeOpen;
+  switch (face) {
+    case kHappy:
+      left = right = kEyeHappy;
+      break;
+    case kSleepy:
+      left = right = kEyeSleepy;
+      break;
+    case kSurprise:
+    case kExcited:
+      left = right = kEyeWide;
+      break;
+    case kWink:
+      left = buddy.winkLeft ? kEyeShut : kEyeOpen;
+      right = buddy.winkLeft ? kEyeOpen : kEyeShut;
+      break;
+    case kDizzy:
+      left = right = kEyeDizzy;
+      break;
+    case kLove:
+      left = right = kEyeLove;
+      break;
+    case kSilly:
+      left = kEyeWide;
+      right = kEyeHappy;
+      break;
+    default:
+      break;
+  }
+
+  int lookYUse = lookY;
+  if (face == kThink) lookYUse = -8;
+  if (face == kSleepy) lookYUse = 5;
+  if (face == kGrumpy) lookYUse = 3;
+
+  drawEye(hx - 30 + jx, hy - 14, open, lookX, lookYUse, left);
+  drawEye(hx + 30 - jx, hy - 14 + jy, open, lookX, lookYUse, right);
+
+  if (face == kGrumpy || face == kThink || face == kSmirk) {
+    canvas.drawWideLine(hx - 52, hy - 42, hx - 16, hy - 34, 3, smile);
+    int raise = (face == kThink || face == kSmirk) ? -10 : 0;
+    canvas.drawWideLine(hx + 16, hy - 34 + raise, hx + 52, hy - 44 + raise, 3, smile);
+  } else if (face == kSurprise || face == kExcited) {
+    canvas.drawWideLine(hx - 48, hy - 50, hx - 16, hy - 46, 3, smile);
+    canvas.drawWideLine(hx + 16, hy - 46, hx + 48, hy - 50, 3, smile);
+  }
+
+  if (face == kHappy || face == kLove || face == kSilly || face == kExcited) {
+    canvas.fillEllipse(hx - 54, hy + 16, 11, 6, blush);
+    canvas.fillEllipse(hx + 54, hy + 16, 11, 6, blush);
+  }
+
+  switch (face) {
+    case kHappy:
+    case kExcited:
+      drawSmile(hx, hy + 22, 26, 16, pink, 3);
+      break;
+    case kSleepy:
+      drawSmile(hx, hy + 28, 14, 5, smile, 2);
+      break;
+    case kSurprise:
+      canvas.fillCircle(hx, hy + 28, 10, smile);
+      canvas.fillCircle(hx, hy + 28, 5, belly);
+      break;
+    case kWink:
+    case kSmirk:
+      drawSmile(hx + 6, hy + 24, 18, 8, smile, 3);
+      break;
+    case kDizzy:
+      drawSmile(hx, hy + 26, 20, (int)(6 * sinf(now * 0.01f)), smile, 3);
+      break;
+    case kLove:
+      drawSmile(hx, hy + 24, 22, 12, pink, 3);
+      break;
+    case kGrumpy:
+      drawSmile(hx, hy + 36, 18, -10, smile, 3);
+      break;
+    case kSilly:
+      drawSmile(hx, hy + 18, 20, 8, smile, 3);
+      canvas.fillEllipse(hx + 4, hy + 34, 8, 10, canvas.color565(255, 110, 150));
+      break;
+    case kThink:
+      canvas.fillRoundRect(hx - 10, hy + 24, 20, 5, 2, smile);
+      break;
+    case kGlitch:
+      canvas.fillRect(hx - 22, hy + 22, 12, 4, smile);
+      canvas.fillRect(hx - 4, hy + 28, 14, 4, canvas.color565(255, 80, 160));
+      canvas.fillRect(hx + 14, hy + 20, 10, 4, smile);
+      break;
+    default:
+      drawSmile(hx, hy + 24, 20, 11, smile, 3);
+      break;
+  }
+
+  canvas.setFont(&fonts::Font4);
+  canvas.setTextColor(canvas.color565(190, 255, 245));
+  if (face == kThink) canvas.drawString("?", hx + 78, hy - 108);
+  if (face == kSurprise) canvas.drawString("!", hx + 78, hy - 108);
+  if (face == kGlitch) canvas.drawString("#", hx + 78, hy - 108);
+}
+
+static void drawHood(int hx, int hy, uint16_t cloth, uint16_t edge) {
+  canvas.fillCircle(hx, hy - 6, 80, cloth);
+  canvas.drawCircle(hx, hy - 6, 80, edge);
+  canvas.drawCircle(hx, hy - 6, 74, edge);
+}
+
+static void drawCoat(int hx, int hy, uint16_t cloth, uint16_t edge, bool zipper) {
+  canvas.fillRoundRect(hx - 74, hy + 16, 148, 78, 20, cloth);
+  canvas.drawRoundRect(hx - 74, hy + 16, 148, 78, 20, edge);
+  canvas.fillRoundRect(hx - 88, hy + 18, 22, 36, 8, cloth);
+  canvas.fillRoundRect(hx + 66, hy + 18, 22, 36, 8, cloth);
+  if (zipper) canvas.drawWideLine(hx, hy + 22, hx, hy + 86, 2, edge);
+}
+
+static void drawBoots(int foot, int cy, uint16_t boot, uint16_t edge) {
+  canvas.fillRoundRect(foot - 46, cy + 76, 34, 24, 7, boot);
+  canvas.fillRoundRect(foot + 12, cy + 76, 34, 24, 7, boot);
+  canvas.drawRoundRect(foot - 46, cy + 76, 34, 24, 7, edge);
+  canvas.drawRoundRect(foot + 12, cy + 76, 34, 24, 7, edge);
+}
+
+static void drawScarf(int hx, int hy, uint16_t cloth, uint16_t edge) {
+  canvas.fillRoundRect(hx - 40, hy + 6, 80, 18, 8, cloth);
+  canvas.drawRoundRect(hx - 40, hy + 6, 80, 18, 8, edge);
+  canvas.fillRoundRect(hx + 16, hy + 16, 16, 32, 6, cloth);
+  canvas.drawRoundRect(hx + 16, hy + 16, 16, 32, 6, edge);
+}
+
+static void drawOutfit(int hx, int hy, int cx, int cy, int foot) {
+  const WeatherKind kind = weatherKind();
+  const uint16_t edge = canvas.color565(20, 28, 40);
+  if (kind == kWeatherNone) return;
+
+  if (kind == kWeatherClear) {
+    const uint16_t tee = canvas.color565(36, 168, 196);
+    drawCoat(hx, hy + 6, tee, canvas.color565(180, 245, 255), false);
+    canvas.fillCircle(hx, hy + 48, 4, canvas.color565(255, 214, 80));
+  } else if (kind == kWeatherCloudy) {
+    const uint16_t hoodie = canvas.color565(78, 104, 138);
+    drawCoat(hx, hy, hoodie, canvas.color565(200, 214, 230), true);
+    canvas.fillCircle(hx - 18, hy - 58, 16, hoodie);
+    canvas.fillCircle(hx + 18, hy - 58, 16, hoodie);
+  } else if (kind == kWeatherFog) {
+    drawScarf(hx, hy, canvas.color565(176, 186, 196), edge);
+  } else if (kind == kWeatherDrizzle || kind == kWeatherRain || kind == kWeatherShowers) {
+    uint16_t coat = canvas.color565(70, 150, 196);
+    if (kind == kWeatherRain) coat = canvas.color565(236, 186, 42);
+    if (kind == kWeatherShowers) coat = canvas.color565(46, 118, 168);
+    drawCoat(hx, hy, coat, edge, true);
+    drawBoots(foot, cy, canvas.color565(28, 36, 52), edge);
+  } else if (kind == kWeatherSnow) {
+    const uint16_t puff = canvas.color565(214, 226, 236);
+    const uint16_t berry = canvas.color565(196, 54, 84);
+    drawCoat(hx, hy, puff, canvas.color565(120, 150, 170), true);
+    drawScarf(hx, hy, canvas.color565(46, 150, 168), edge);
+    canvas.fillCircle(hx - 78, hy + 40, 10, berry);
+    canvas.fillCircle(hx + 78, hy + 40, 10, berry);
+    drawBoots(foot, cy, canvas.color565(52, 64, 84), edge);
+  } else if (kind == kWeatherStorm) {
+    const uint16_t coat = canvas.color565(42, 32, 78);
+    drawCoat(hx, hy, coat, canvas.color565(170, 150, 255), true);
+    canvas.fillTriangle(hx - 8, hy + 34, hx + 6, hy + 34, hx - 2, hy + 52, canvas.color565(255, 214, 64));
+    canvas.fillTriangle(hx + 2, hy + 50, hx + 14, hy + 50, hx + 4, hy + 70, canvas.color565(255, 214, 64));
+    drawBoots(foot, cy, canvas.color565(24, 20, 40), edge);
+  }
+
+  (void)cx;
+}
+
+static void drawSunglasses(int hx, int hy) {
+  if (weatherKind() != kWeatherClear) return;
+  const uint16_t frame = canvas.color565(24, 28, 36);
+  const uint16_t lens = canvas.color565(70, 150, 170);
+  canvas.fillRoundRect(hx - 50, hy - 24, 40, 18, 6, frame);
+  canvas.fillRoundRect(hx + 10, hy - 24, 40, 18, 6, frame);
+  canvas.fillRoundRect(hx - 46, hy - 21, 32, 12, 4, lens);
+  canvas.fillRoundRect(hx + 14, hy - 21, 32, 12, 4, lens);
+  canvas.drawWideLine(hx - 10, hy - 16, hx + 10, hy - 16, 2, frame);
+}
+
+static void blitHimop(int cx, int cy, const HimopFrame &frame, bool mirror) {
+  uint16_t *dst = (uint16_t *)canvas.getBuffer();
+  const int stride = canvas.width();
+  const int x0 = cx - frame.w / 2;
+  const int y0 = cy - frame.h / 2;
+  for (int y = 0; y < frame.h; ++y) {
+    const int dy = y0 + y;
+    if ((unsigned)dy >= (unsigned)H) continue;
+    for (int x = 0; x < frame.w; ++x) {
+      const int i = y * frame.w + x;
+      if ((frame.mask[i >> 3] & (0x80 >> (i & 7))) == 0) continue;
+      const int dx = x0 + (mirror ? (frame.w - 1 - x) : x);
+      if ((unsigned)dx >= (unsigned)W) continue;
+      dst[dy * stride + dx] = frame.px[i];
+    }
+  }
+  himopCrownX = mirror ? x0 + frame.w - frame.w / 5 : x0 + frame.w / 5;
+  himopCrownY = y0 + frame.h / 7;
+  himopSpriteH = frame.h;
+}
+
+static void blitRaw(int cx, int cy, const uint16_t *px, const uint8_t *mask, int w, int h, bool mirror) {
+  HimopFrame frame = {px, mask, w, h};
+  blitHimop(cx, cy, frame, mirror);
+}
+
+static void drawHimop(int hx, int hy, uint32_t now) {
+  const bool curled = buddy.face == kSleepy || buddy.action == kYawn;
+  const bool mirror = !curled && buddy.tx > buddy.x + 8.0f;
+  int index = 0;
+  if (curled) {
+    index = 6;
+  } else if (buddy.action == kFlee) {
+    index = 8;
+  } else if (isHappy(now) || buddy.face == kHappy) {
+    index = 7;
+  } else if (buddy.action == kWander) {
+    index = ((now / 220) & 1) ? 5 : 4;
+  } else if (buddy.action == kGraze) {
+    const uint32_t left = buddy.until > now ? buddy.until - now : 0;
+    if (left < 900) index = 11;
+    else index = ((now / 280) & 1) ? 10 : 9;
+  } else if (buddy.action == kFly) {
+    index = 12 + (int)((now / 120) % 6);
+  } else {
+    index = ((now / 900) & 1) ? 1 : 0;
+  }
+
+  if (haveCardSprites && index < 18 && cardFrames[index].px != nullptr) {
+    blitRaw(hx, hy, cardFrames[index].px, cardFrames[index].mask, cardFrames[index].w, cardFrames[index].h,
+            mirror);
+  } else {
+    const HimopFrame &frame = curled ? himopNap : himopFly;
+    blitHimop(hx, hy, frame, mirror);
+  }
+}
+
+static void drawBuddy(uint32_t now) {
+  const uint16_t bg = canvas.color565(0, 0, 0);
+  const uint16_t grid = canvas.color565(10, 16, 24);
+  const uint16_t gridHot = canvas.color565(18, 36, 48);
+  const bool happy = isHappy(now);
+  const bool sleepy = buddy.face == kSleepy;
+
+  int hour = weatherHour();
+  int bgIndex = -1;
+  if (hour >= 5 && hour < 12) bgIndex = 0;
+  else if (hour >= 12 && hour < 17) bgIndex = 1;
+  else if (hour >= 17 && hour < 21) bgIndex = 2;
+  else if (hour >= 0) bgIndex = 3;
+  if (haveBackgrounds && bgIndex >= 0 && dayBg[bgIndex] != nullptr) {
+    memcpy(canvas.getBuffer(), dayBg[bgIndex], (size_t)W * H * 2);
+  } else {
+    canvas.fillScreen(bg);
+    for (int x = 24; x < W; x += 28) canvas.drawFastVLine(x, 0, H, grid);
+    for (int y = 20; y < H; y += 28) canvas.drawFastHLine(0, y, W, grid);
+    canvas.drawFastVLine((int)((now / 18) % W), 0, H, gridHot);
+  }
+
+  int bob = sleepy ? (int)(sinf(now * 0.0011f) * 2.0f) : (int)(sinf(now * 0.0022f) * 5.0f);
+  int hop = 0;
+  if (buddy.action == kFly || buddy.action == kFlee) {
+    hop = 6 + (int)(sinf(now * 0.0032f) * 4.0f);
+  }
+  if (happy) hop += 6;
+
+  int sway = (buddy.action == kFly || buddy.action == kFlee) ? (int)(sinf(now * 0.002f) * 4.0f) : 0;
+
+  const int cx = (int)buddy.x;
+  const int cy = (int)buddy.y - hop + bob;
+  const int hx = cx + sway;
+  const int hy = cy;
+
+  int shadowRx = 46 - hop / 5;
+  if (shadowRx < 22) shadowRx = 22;
+  canvas.fillEllipse(cx, hy + himopSpriteH / 2 - 6, shadowRx, 8, canvas.color565(8, 8, 12));
+
+  if (now < kookerUntil) {
+    const uint16_t kook = canvas.color565(48, 18, 72);
+    canvas.fillEllipse(kookerX, hy + 10, 22, 16, kook);
+    canvas.fillCircle(kookerX - 6, hy + 6, 3, canvas.color565(230, 220, 80));
+    canvas.fillCircle(kookerX + 6, hy + 6, 3, canvas.color565(230, 220, 80));
+    canvas.setFont(&fonts::FreeSansBold12pt7b);
+    canvas.setTextDatum(middle_center);
+    canvas.setTextColor(canvas.color565(255, 236, 250));
+    canvas.drawString("kooker", kookerX, hy + 36);
+  }
+
+  float blinkOpen = 1.0f;
+  uint32_t blink = now % 4200;
+  if (buddy.face != kHappy && buddy.face != kWink && buddy.face != kDizzy &&
+      buddy.face != kLove && blink > 3900) {
+    float p = (blink - 3900) / 300.0f;
+    blinkOpen = (p < 0.5f) ? (1.0f - p * 2.0f) : ((p - 0.5f) * 2.0f);
+  }
+
+  static float prevX = 240;
+  int lookX = clampi((int)((buddy.x - prevX) * 4.0f), -8, 8);
+  prevX = buddy.x;
+  int lookY = (int)(cosf(now * 0.0005f) * 3.0f);
+
+  drawHimop(hx, hy, now);
+  (void)lookX;
+  (void)lookY;
+  (void)blinkOpen;
+
+  for (int i = 0; i < kMotes; ++i) {
+    Mote &m = motes[i];
+    if (m.life == 0) continue;
+    m.y += m.vy;
+    m.life--;
+    if (m.kind == 1) {
+      drawHeart((int)m.x, (int)m.y, 5, canvas.color565(255, 120 + (m.life % 40), 180));
+    } else {
+      uint8_t a = (uint8_t)(40 + m.life);
+      if (a > 180) a = 180;
+      canvas.fillCircle((int)m.x, (int)m.y, (m.life > 20) ? 2 : 1, canvas.color565(a / 3, a, a));
+    }
+    if (m.life == 0 || m.y < -10 || m.y > H + 10) {
+      if (!happy || m.kind == 0) spawnSpark(m);
+      else m.life = 0;
+    }
+  }
+
+  const uint16_t label = canvas.color565(255, 255, 255);
+  const lgfx::GFXfont *hud = &fonts::FreeSansBold18pt7b;
+  const lgfx::GFXfont *title = &fonts::FreeSansBold24pt7b;
+  canvas.setFont(hud);
+  const int hudBand = canvas.fontHeight() + 12;
+  canvas.setFont(title);
+  const int titleBand = canvas.fontHeight() + 12;
+  const int yClock = 8 + hudBand / 2;
+  const int yName = yClock + hudBand / 2 + 10 + titleBand / 2;
+  const int yCaption = H - 8 - hudBand / 2;
+  const int yWeather = yCaption - hudBand / 2 - 10 - hudBand / 2;
+  if (weatherTime()[0] != '\0') drawLabel(weatherTime(), 16, yClock, label, middle_left, hud);
+  if (weatherDate()[0] != '\0') drawLabel(weatherDate(), W - 16, yClock, label, middle_right, hud);
+  drawLabel(petName, W / 2, yName, label, middle_center, title);
+  drawLabel(weatherCurrent(), W / 2, yWeather, label, middle_center, hud);
+  drawLabel(buddy.caption ? buddy.caption : "soaring", W / 2, yCaption, label, middle_center, hud);
+
+  drawSpeech(hx, hy);
+
+  if (sleepy && ((now / 600) % 2 == 0)) {
+    canvas.setFont(&fonts::FreeSansBold18pt7b);
+    canvas.setTextColor(canvas.color565(255, 255, 255));
+    canvas.drawString("z", hx + 54, hy - 96 - (int)((now / 40) % 14));
+  }
+}
+
+static void pollTouch(uint32_t now) {
+  int32_t x = 0;
+  int32_t y = 0;
+  if (!display.getTouch(&x, &y)) return;
+  bool freshPet = (now - lastPetMs) > 300;
+  lastPetMs = now;
+  seenTouch = true;
+  bool wasSleeping = buddy.face == kSleepy;
+  buddy.until = now + reactionMs;
+  buddy.action = kFly;
+  buddy.anchorX = buddy.x;
+  buddy.anchorY = buddy.y;
+  kookerUntil = 0;
+  speech.visible = false;
+  placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMinY + 50));
+  if (freshPet) {
+    buddy.face = kHappy;
+    buddy.caption = wasSleeping ? "waking up" : "enjoys that";
+    Serial.printf("pet enjoy face %u\n", buddy.face);
+  }
+  int spawned = 0;
+  for (int i = 0; i < kMotes && spawned < 2; ++i) {
+    if (motes[i].kind == 1 && motes[i].life > 0) continue;
+    if (motes[i].life > 30 && motes[i].kind == 0) continue;
+    spawnHeart(motes[i], buddy.x, buddy.y - 40);
+    spawned++;
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("cyber buddy boot");
+  Serial.printf("PSRAM bytes: %u\n", (unsigned)ESP.getPsramSize());
+
+  rngState ^= micros();
+  for (int i = 0; i < kMotes; ++i) spawnSpark(motes[i]);
+
+  buddy.x = buddy.tx = buddy.anchorX = 240;
+  buddy.y = buddy.ty = buddy.anchorY = 250;
+  buddy.face = kNeutral;
+  buddy.action = kFly;
+  buddy.caption = "soaring";
+  buddy.until = 0;
+
+  bool displayOk = display.init();
+  display.setRotation(0);
+  display.setBrightness(255);
+  ledcDetach(38);
+  pinMode(38, OUTPUT);
+  digitalWrite(38, HIGH);
+  display.fillScreen(TFT_BLACK);
+  Serial.printf("display init %s, backlight forced on\n", displayOk ? "ok" : "FAILED");
+
+  canvas.setPsram(true);
+  canvas.setColorDepth(16);
+  if (!canvas.createSprite(W, H)) {
+    Serial.println("sprite alloc failed");
+  } else {
+    Serial.println("sprite ok");
+  }
+
+  bootMs = millis();
+  lastPetMs = bootMs;
+
+  if (loadPetCard(petName, sizeof(petName), &reactionMs, petDescription, sizeof(petDescription),
+                  phraseStore, 24, &kindCount, petStore, 12, &petLineCount)) {
+    for (int i = 0; i < kindCount; ++i) phrasePtrs[i] = phraseStore[i];
+    if (kindCount > 0) kindLines = phrasePtrs;
+    for (int i = 0; i < petLineCount; ++i) petLinePtrs[i] = petStore[i];
+    Serial.printf("card name '%s' hold %u phrases %d pet lines %d\n", petName, (unsigned)reactionMs,
+                  kindCount, petLineCount);
+    haveCardSprites = loadHimopSprites(cardFrames, 18);
+    haveBackgrounds = loadDayBackgrounds(dayBg, 4);
+    Serial.println(haveCardSprites ? "card sprites ok" : "card sprites missing");
+    Serial.println(haveBackgrounds ? "card backgrounds ok" : "card backgrounds missing");
+  }
+  speech.visible = false;
+  weatherBegin();
+}
+
+void loop() {
+  static uint32_t lastFrame = 0;
+  uint32_t now = millis();
+  if (now - lastFrame < 33) return;
+  lastFrame = now;
+
+  pollTouch(now);
+  updateBuddy(now);
+  rollSpeech(now);
+  weatherTick(now);
+  drawBuddy(now);
+  canvas.pushSprite(0, 0);
+}

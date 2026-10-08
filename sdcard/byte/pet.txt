@@ -1,0 +1,9 @@
+# Lines shown when the screen is tapped.
+that was nice
+yay a pet
+more please
+you are the best
+i like this
+hello again
+thanks for that
+you showed up
