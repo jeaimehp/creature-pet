@@ -13,6 +13,12 @@ static constexpr int kSdMosi = 47;
 static constexpr int kSdCs = 42;
 static constexpr int kDisplayCs = 39;
 
+// Card files are little-endian RGB565. LovyanGFX 16-bit sprites hold each pixel
+// byte-swapped, so swap once here and the frame loop can copy them as is.
+static void toSpriteOrder(uint16_t *px, size_t count) {
+  for (size_t i = 0; i < count; ++i) px[i] = __builtin_bswap16(px[i]);
+}
+
 static void copyTrimmed(char *dst, size_t dstLen, const String &src) {
   size_t start = 0;
   while (start < src.length() && (src[start] == ' ' || src[start] == '\t' || src[start] == '\r')) {
@@ -146,6 +152,7 @@ bool loadHimopSprites(HimopCardFrame *frames, int count) {
       continue;
     }
     file.close();
+    toSpriteOrder(px, (size_t)w * (size_t)h);
     frames[i].px = px;
     frames[i].mask = mask;
     frames[i].w = w;
@@ -188,6 +195,7 @@ bool loadDayBackgrounds(uint16_t **slots, int count) {
       continue;
     }
     file.close();
+    toSpriteOrder(px, 480UL * 480UL);
     slots[i] = px;
     loaded++;
     Serial.printf("background %s\n", kNames[i]);

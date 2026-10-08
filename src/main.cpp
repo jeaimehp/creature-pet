@@ -13,8 +13,8 @@ static constexpr int W = 480;
 static constexpr int H = 480;
 static constexpr int kMinX = 150;
 static constexpr int kMaxX = 330;
-static constexpr int kMinY = 200;
-static constexpr int kMaxY = 290;
+static constexpr int kMinY = 190;
+static constexpr int kMaxY = 280;
 
 static int himopCrownX = 240;
 static int himopCrownY = 90;
@@ -43,6 +43,33 @@ static int clampi(int v, int lo, int hi) {
   if (v > hi) return hi;
   return v;
 }
+
+// Screen rectangle, half-open. Empty when x0 >= x1.
+struct Box {
+  int x0, y0, x1, y1;
+};
+
+static bool boxEmpty(const Box &b) { return b.x0 >= b.x1 || b.y0 >= b.y1; }
+
+static void growBox(Box &b, int x, int y, int w, int h) {
+  const int x0 = clampi(x, 0, W), y0 = clampi(y, 0, H);
+  const int x1 = clampi(x + w, 0, W), y1 = clampi(y + h, 0, H);
+  if (x0 >= x1 || y0 >= y1) return;
+  if (boxEmpty(b)) {
+    b = {x0, y0, x1, y1};
+    return;
+  }
+  if (x0 < b.x0) b.x0 = x0;
+  if (y0 < b.y0) b.y0 = y0;
+  if (x1 > b.x1) b.x1 = x1;
+  if (y1 > b.y1) b.y1 = y1;
+}
+
+// Everything that moves this frame. Only this area (plus last frame's) is
+// redrawn and pushed, so the CPU leaves PSRAM free for the panel's DMA.
+static Box dynBox = {0, 0, 0, 0};
+
+static void markDirty(int x, int y, int w, int h) { growBox(dynBox, x, y, w, h); }
 
 enum Face : uint8_t {
   kNeutral,
@@ -305,18 +332,90 @@ static uint8_t nextTouchFace() {
   return pick;
 }
 
-static void drawLabel(const char *text, int x, int y, uint16_t color, uint8_t datum,
-                       const lgfx::GFXfont *font) {
+// Dims the scene to a quarter inside a rounded rect so labels read like smoked glass.
+static void shadePanel(int x, int y, int w, int h, int r) {
+  uint16_t *buf = (uint16_t *)canvas.getBuffer();
+  int32_t cx, cy, cw, ch;
+  canvas.getClipRect(&cx, &cy, &cw, &ch);
+  const int x0 = clampi(x, cx, cx + cw), x1 = clampi(x + w, cx, cx + cw);
+  const int y0 = clampi(y, cy, cy + ch), y1 = clampi(y + h, cy, cy + ch);
+  for (int py = y0; py < y1; ++py) {
+    const int ey = py < y + r ? y + r - py : (py >= y + h - r ? py - (y + h - r - 1) : 0);
+    for (int px = x0; px < x1; ++px) {
+      const int ex = px < x + r ? x + r - px : (px >= x + w - r ? px - (x + w - r - 1) : 0);
+      if (ex * ex + ey * ey > r * r) continue;
+      uint16_t c = __builtin_bswap16(buf[py * W + px]);
+      buf[py * W + px] = __builtin_bswap16((c >> 2) & 0x39E7);
+    }
+  }
+}
+
+static constexpr int kLabelPadX = 12;
+static constexpr int kLabelPadY = 4;
+
+enum LabelSlot { kLabelTime, kLabelDate, kLabelWeather, kLabelName, kLabelCaption, kLabelCount };
+
+struct Label {
+  char text[32];
+  const lgfx::GFXfont *font;
+  uint16_t color;
+  Box box;  // shaded panel, empty when the label is hidden
+};
+
+// Sizes a label's panel. (x, y) is the panel's outer corner named by datum.
+// Returns the panel height so stacked labels can be placed below or above it.
+static int placeLabel(Label &label, const char *text, int x, int y, uint8_t datum,
+                      const lgfx::GFXfont *font, uint16_t color) {
+  strncpy(label.text, text ? text : "", sizeof(label.text) - 1);
+  label.text[sizeof(label.text) - 1] = '\0';
+  label.font = font;
+  label.color = color;
+  label.box = {0, 0, 0, 0};
+  if (label.text[0] == '\0') return 0;
   canvas.setFont(font);
-  canvas.setTextDatum(datum);
-  int tw = canvas.textWidth(text);
-  int th = canvas.fontHeight();
+  const int pw = canvas.textWidth(label.text) + kLabelPadX * 2;
+  const int ph = canvas.fontHeight() + kLabelPadY * 2;
   int left = x;
-  if (datum == middle_center) left = x - tw / 2;
-  else if (datum == middle_right) left = x - tw;
-  canvas.fillRoundRect(left - 10, y - th / 2 - 6, tw + 20, th + 12, 12, canvas.color565(6, 10, 22));
-  canvas.setTextColor(color);
-  canvas.drawString(text, x, y);
+  if (datum == top_right || datum == bottom_right) left = x - pw;
+  int top = y;
+  if (datum == bottom_left || datum == bottom_right) top = y - ph;
+  label.box = {left, top, left + pw, top + ph};
+  return ph;
+}
+
+// Corners: clock and date top-left, weather top-right, name and caption
+// bottom-left. The middle stays clear for Himop.
+static void layoutLabels(Label labels[kLabelCount]) {
+  constexpr int kEdge = 12;
+  constexpr int kGap = 4;
+  const uint16_t white = canvas.color565(255, 255, 255);
+  const uint16_t soft = canvas.color565(200, 225, 255);
+  const lgfx::GFXfont *hud = &fonts::FreeSansBold18pt7b;
+  const lgfx::GFXfont *small = &fonts::FreeSansBold12pt7b;
+  const lgfx::GFXfont *title = &fonts::FreeSansBold24pt7b;
+  int y = kEdge;
+  const int timeH = placeLabel(labels[kLabelTime], weatherTime(), kEdge, y, top_left, hud, white);
+  if (timeH > 0) y += timeH + kGap;
+  placeLabel(labels[kLabelDate], weatherDate(), kEdge, y, top_left, small, soft);
+  placeLabel(labels[kLabelWeather], weatherCurrent(), W - kEdge, kEdge, top_right, hud, white);
+  y = H - kEdge;
+  y -= placeLabel(labels[kLabelCaption], buddy.caption ? buddy.caption : "soaring", kEdge, y,
+                  bottom_left, small, soft) + kGap;
+  placeLabel(labels[kLabelName], petName, kEdge, y, bottom_left, title, white);
+}
+
+// Draws text on a shaded panel, honoring the canvas clip rect.
+static void drawLabel(const Label &label) {
+  if (boxEmpty(label.box)) return;
+  const Box &b = label.box;
+  shadePanel(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0, 10);
+  canvas.setFont(label.font);
+  canvas.setTextDatum(middle_left);
+  const int midY = (b.y0 + b.y1) / 2;
+  canvas.setTextColor(canvas.color565(0, 0, 0));
+  canvas.drawString(label.text, b.x0 + kLabelPadX + 2, midY + 2);
+  canvas.setTextColor(label.color);
+  canvas.drawString(label.text, b.x0 + kLabelPadX, midY);
 }
 
 static void drawSpeech(int hx, int hy) {
@@ -359,6 +458,7 @@ static void drawSpeech(int hx, int hy) {
 
   canvas.fillRoundRect(bx, by, bw, bh, 12, fill);
   canvas.drawRoundRect(bx, by, bw, bh, 12, edge);
+  markDirty(bx - 2, by - 2, bw + 4, bh + 4);
 
   canvas.setTextColor(ink);
   if (two) {
@@ -647,7 +747,9 @@ static void drawSunglasses(int hx, int hy) {
   canvas.drawWideLine(hx - 10, hy - 16, hx + 10, hy - 16, 2, frame);
 }
 
-static void blitHimop(int cx, int cy, const HimopFrame &frame, bool mirror) {
+// Sprite buffers hold byte-swapped RGB565. Card frames are swapped at load;
+// the built-in art is native order, so it passes swap = true.
+static void blitHimop(int cx, int cy, const HimopFrame &frame, bool mirror, bool swap) {
   uint16_t *dst = (uint16_t *)canvas.getBuffer();
   const int stride = canvas.width();
   const int x0 = cx - frame.w / 2;
@@ -660,9 +762,10 @@ static void blitHimop(int cx, int cy, const HimopFrame &frame, bool mirror) {
       if ((frame.mask[i >> 3] & (0x80 >> (i & 7))) == 0) continue;
       const int dx = x0 + (mirror ? (frame.w - 1 - x) : x);
       if ((unsigned)dx >= (unsigned)W) continue;
-      dst[dy * stride + dx] = frame.px[i];
+      dst[dy * stride + dx] = swap ? __builtin_bswap16(frame.px[i]) : frame.px[i];
     }
   }
+  markDirty(x0, y0, frame.w, frame.h);
   himopCrownX = mirror ? x0 + frame.w - frame.w / 5 : x0 + frame.w / 5;
   himopCrownY = y0 + frame.h / 7;
   himopSpriteH = frame.h;
@@ -670,7 +773,7 @@ static void blitHimop(int cx, int cy, const HimopFrame &frame, bool mirror) {
 
 static void blitRaw(int cx, int cy, const uint16_t *px, const uint8_t *mask, int w, int h, bool mirror) {
   HimopFrame frame = {px, mask, w, h};
-  blitHimop(cx, cy, frame, mirror);
+  blitHimop(cx, cy, frame, mirror, false);
 }
 
 static void drawHimop(int hx, int hy, uint32_t now) {
@@ -700,14 +803,43 @@ static void drawHimop(int hx, int hy, uint32_t now) {
             mirror);
   } else {
     const HimopFrame &frame = curled ? himopNap : himopFly;
-    blitHimop(hx, hy, frame, mirror);
+    blitHimop(hx, hy, frame, mirror, true);
   }
 }
 
-static void drawBuddy(uint32_t now) {
-  const uint16_t bg = canvas.color565(0, 0, 0);
+// Areas to push to the panel this frame, filled by drawBuddy.
+static constexpr int kMaxPush = 2 + kLabelCount * 2;
+static Box pushBoxes[kMaxPush];
+static int pushCount = 0;
+
+static void drawGrid(uint32_t now) {
   const uint16_t grid = canvas.color565(10, 16, 24);
   const uint16_t gridHot = canvas.color565(18, 36, 48);
+  canvas.fillScreen(canvas.color565(0, 0, 0));
+  for (int x = 24; x < W; x += 28) canvas.drawFastVLine(x, 0, H, grid);
+  for (int y = 20; y < H; y += 28) canvas.drawFastHLine(0, y, W, grid);
+  canvas.drawFastVLine((int)((now / 18) % W), 0, H, gridHot);
+}
+
+// Copies the landscape back over one box and redraws the labels clipped to it.
+static void restoreBox(const Box &b, const uint16_t *scene, const Label labels[kLabelCount]) {
+  if (boxEmpty(b)) return;
+  uint16_t *buf = (uint16_t *)canvas.getBuffer();
+  const size_t rowBytes = (size_t)(b.x1 - b.x0) * 2;
+  for (int y = b.y0; y < b.y1; ++y) memcpy(buf + y * W + b.x0, scene + y * W + b.x0, rowBytes);
+  canvas.setClipRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+  for (int i = 0; i < kLabelCount; ++i) drawLabel(labels[i]);
+  canvas.clearClipRect();
+}
+
+static void addPush(const Box &b) {
+  if (!boxEmpty(b) && pushCount < kMaxPush) pushBoxes[pushCount++] = b;
+}
+
+static void drawBuddy(uint32_t now) {
+  static Box prevDyn = {0, 0, 0, 0};
+  static Label shown[kLabelCount] = {};
+  static const uint16_t *shownScene = nullptr;
   const bool happy = isHappy(now);
   const bool sleepy = buddy.face == kSleepy;
 
@@ -717,14 +849,36 @@ static void drawBuddy(uint32_t now) {
   else if (hour >= 12 && hour < 17) bgIndex = 1;
   else if (hour >= 17 && hour < 21) bgIndex = 2;
   else if (hour >= 0) bgIndex = 3;
-  if (haveBackgrounds && bgIndex >= 0 && dayBg[bgIndex] != nullptr) {
-    memcpy(canvas.getBuffer(), dayBg[bgIndex], (size_t)W * H * 2);
+  const uint16_t *scene = (haveBackgrounds && bgIndex >= 0) ? dayBg[bgIndex] : nullptr;
+
+  Label labels[kLabelCount];
+  layoutLabels(labels);
+
+  // With a landscape, only last frame's moving area and any changed labels are
+  // restored. The grid fallback animates everywhere, so it redraws in full.
+  pushCount = 0;
+  const Box whole = {0, 0, W, H};
+  if (scene == nullptr) {
+    drawGrid(now);
+    for (int i = 0; i < kLabelCount; ++i) drawLabel(labels[i]);
+    addPush(whole);
+  } else if (scene != shownScene) {
+    restoreBox(whole, scene, labels);
+    addPush(whole);
   } else {
-    canvas.fillScreen(bg);
-    for (int x = 24; x < W; x += 28) canvas.drawFastVLine(x, 0, H, grid);
-    for (int y = 20; y < H; y += 28) canvas.drawFastHLine(0, y, W, grid);
-    canvas.drawFastVLine((int)((now / 18) % W), 0, H, gridHot);
+    restoreBox(prevDyn, scene, labels);
+    addPush(prevDyn);
+    for (int i = 0; i < kLabelCount; ++i) {
+      if (strcmp(labels[i].text, shown[i].text) == 0) continue;
+      restoreBox(shown[i].box, scene, labels);
+      restoreBox(labels[i].box, scene, labels);
+      addPush(shown[i].box);
+      addPush(labels[i].box);
+    }
   }
+  shownScene = scene;
+  memcpy(shown, labels, sizeof(shown));
+  dynBox = {0, 0, 0, 0};
 
   int bob = sleepy ? (int)(sinf(now * 0.0011f) * 2.0f) : (int)(sinf(now * 0.0022f) * 5.0f);
   int hop = 0;
@@ -742,7 +896,9 @@ static void drawBuddy(uint32_t now) {
 
   int shadowRx = 46 - hop / 5;
   if (shadowRx < 22) shadowRx = 22;
-  canvas.fillEllipse(cx, hy + himopSpriteH / 2 - 6, shadowRx, 8, canvas.color565(8, 8, 12));
+  const int shadowY = hy + himopSpriteH / 2 - 6;
+  canvas.fillEllipse(cx, shadowY, shadowRx, 8, canvas.color565(8, 8, 12));
+  markDirty(cx - shadowRx - 1, shadowY - 9, shadowRx * 2 + 3, 19);
 
   if (now < kookerUntil) {
     const uint16_t kook = canvas.color565(48, 18, 72);
@@ -753,33 +909,24 @@ static void drawBuddy(uint32_t now) {
     canvas.setTextDatum(middle_center);
     canvas.setTextColor(canvas.color565(255, 236, 250));
     canvas.drawString("kooker", kookerX, hy + 36);
+    markDirty(kookerX - 60, hy - 10, 120, 64);
   }
-
-  float blinkOpen = 1.0f;
-  uint32_t blink = now % 4200;
-  if (buddy.face != kHappy && buddy.face != kWink && buddy.face != kDizzy &&
-      buddy.face != kLove && blink > 3900) {
-    float p = (blink - 3900) / 300.0f;
-    blinkOpen = (p < 0.5f) ? (1.0f - p * 2.0f) : ((p - 0.5f) * 2.0f);
-  }
-
-  static float prevX = 240;
-  int lookX = clampi((int)((buddy.x - prevX) * 4.0f), -8, 8);
-  prevX = buddy.x;
-  int lookY = (int)(cosf(now * 0.0005f) * 3.0f);
 
   drawHimop(hx, hy, now);
-  (void)lookX;
-  (void)lookY;
-  (void)blinkOpen;
 
   for (int i = 0; i < kMotes; ++i) {
     Mote &m = motes[i];
     if (m.life == 0) continue;
+    // Drifting sparks belong to the grid. Over a landscape they would dirty the whole screen.
+    if (m.kind == 0 && scene != nullptr) {
+      m.life = 0;
+      continue;
+    }
     m.y += m.vy;
     m.life--;
     if (m.kind == 1) {
       drawHeart((int)m.x, (int)m.y, 5, canvas.color565(255, 120 + (m.life % 40), 180));
+      markDirty((int)m.x - 12, (int)m.y - 7, 24, 25);
     } else {
       uint8_t a = (uint8_t)(40 + m.life);
       if (a > 180) a = 180;
@@ -791,30 +938,19 @@ static void drawBuddy(uint32_t now) {
     }
   }
 
-  const uint16_t label = canvas.color565(255, 255, 255);
-  const lgfx::GFXfont *hud = &fonts::FreeSansBold18pt7b;
-  const lgfx::GFXfont *title = &fonts::FreeSansBold24pt7b;
-  canvas.setFont(hud);
-  const int hudBand = canvas.fontHeight() + 12;
-  canvas.setFont(title);
-  const int titleBand = canvas.fontHeight() + 12;
-  const int yClock = 8 + hudBand / 2;
-  const int yName = yClock + hudBand / 2 + 10 + titleBand / 2;
-  const int yCaption = H - 8 - hudBand / 2;
-  const int yWeather = yCaption - hudBand / 2 - 10 - hudBand / 2;
-  if (weatherTime()[0] != '\0') drawLabel(weatherTime(), 16, yClock, label, middle_left, hud);
-  if (weatherDate()[0] != '\0') drawLabel(weatherDate(), W - 16, yClock, label, middle_right, hud);
-  drawLabel(petName, W / 2, yName, label, middle_center, title);
-  drawLabel(weatherCurrent(), W / 2, yWeather, label, middle_center, hud);
-  drawLabel(buddy.caption ? buddy.caption : "soaring", W / 2, yCaption, label, middle_center, hud);
-
   drawSpeech(hx, hy);
 
   if (sleepy && ((now / 600) % 2 == 0)) {
+    const int zy = hy - 96 - (int)((now / 40) % 14);
     canvas.setFont(&fonts::FreeSansBold18pt7b);
+    canvas.setTextDatum(middle_center);
     canvas.setTextColor(canvas.color565(255, 255, 255));
-    canvas.drawString("z", hx + 54, hy - 96 - (int)((now / 40) % 14));
+    canvas.drawString("z", hx + 54, zy);
+    markDirty(hx + 30, zy - 30, 50, 60);
   }
+
+  addPush(dynBox);
+  prevDyn = dynBox;
 }
 
 static void pollTouch(uint32_t now) {
@@ -909,5 +1045,10 @@ void loop() {
   rollSpeech(now);
   weatherTick(now);
   drawBuddy(now);
-  canvas.pushSprite(0, 0);
+  for (int i = 0; i < pushCount; ++i) {
+    const Box &b = pushBoxes[i];
+    display.setClipRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
+    canvas.pushSprite(0, 0);
+  }
+  display.clearClipRect();
 }

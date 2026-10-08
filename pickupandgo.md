@@ -5,11 +5,9 @@ Update this file as each step finishes.
 
 ## Status
 
-**Not ready to move the card.** The board is flashed for 16-bit RGB565, the six flying poses, and the four landscapes. The last time the NO NAME card was mounted, sprites `0.bin`–`17.bin` and morning, afternoon, and evening were on it. `night.bin` was missing, and the card was unplugged before that file could be copied back.
+**Running.** The NO NAME card is in the TF slot. On 2026-10-07 at 9:20 PM the boot log showed all 18 sprites and all four landscapes loaded, `night.bin` included. A C920 photo showed the night scene in true color with napping Himop.
 
-Put **NO NAME** in the Mac again. After `night.bin` is on the card, eject it, put it in the TF slot above the USB port, then unplug the board and plug it back in.
-
-After that reboot, Himop should:
+Himop should:
 
 - Soar by cycling the six flying poses in `12.bin`–`17.bin`
 - Walk, rarely, by alternating the two step frames
@@ -18,7 +16,7 @@ After that reboot, Himop should:
 - Roar “ROW, ROW, ROW” only when a kooker appears
 - Show the happy pose when tapped, and wake up first if he was napping
 - Show the current temperature and conditions, with no forecast
-- Show the name, clock, date, weather, and caption in large bold type on dark labels. The description is not shown.
+- Show labels in the corners on dimmed see-through panels: clock with the date under it at top left, weather at top right, name with the caption under it at bottom left. The middle stays clear for Himop. The description is not shown.
 - Use the landscape that matches the clock: morning 5:00–11:59, afternoon 12:00–4:59, evening 5:00–8:59, night otherwise
 
 ## Sprites
@@ -104,8 +102,10 @@ TF card, after the display is up and CS 39 is held high: CS 42, MOSI 47, MISO 41
 - [x] Flash the loader that plays those poses
 - [x] Confirm Wi-Fi connects and the current conditions show
 - [x] Flash 16-bit RGB565 panel mode and the six-pose flying cycle
-- [ ] Copy `night.bin` back onto the NO NAME card
-- [ ] Move the card into the TF slot and reboot so the poses and landscapes appear
+- [x] Copy `night.bin` back onto the NO NAME card
+- [x] Move the card into the TF slot and reboot so the poses and landscapes appear
+- [x] Fix washed-out pictures (byte order) and move the labels to the corners
+- [x] Stop the screen jumping (redraw and push only what changed)
 
 ## Reflash later
 
@@ -116,12 +116,16 @@ pio run -t upload --upload-port /dev/tty.usbserial-12430
 pio device monitor --port /dev/tty.usbserial-12430 --baud 115200
 ```
 
+Serial is easiest to read with `~/.platformio/penv/bin/python` and pyserial. The system `python3` does not have pyserial installed. Take webcam photos with `imagesnap -d "HD Pro Webcam C920" -w 4 out.jpg`. The 4-second warm-up matters, because a shorter one gives a black frame.
+
 If upload cannot reset the board, hold BOOT, tap RESET, release BOOT, and run the upload again.
 
 ## If the picture is wrong
 
 - Blank screen: the backlight boost on GPIO 38 stays off if it is PWM'd around 20 kHz. Firmware now drives that pin high after init. A dark mirror in a photo means the backlight is still off.
 - Shifted or torn image: change H/V polarity or the back porches in `src/lgfx_board.hpp`.
+- Washed out, or dark areas turned bright and speckled: the pixel bytes are reversed. Card `.bin` files are little-endian RGB565, but LovyanGFX 16-bit sprites store each pixel byte-swapped. `src/sd_store.cpp` swaps card pixels once when it loads them, and `blitHimop` swaps the built-in art. Raw pixels copied into `canvas` must be swapped.
+- Screen jumps, shifts, or shows doubled text: PSRAM is starved. LovyanGFX's `Bus_RGB` has the LCD DMA read the framebuffer straight from PSRAM with no bounce buffer, so heavy CPU PSRAM traffic makes it underrun. With a landscape loaded, `drawBuddy` restores only last frame's moving area (`dynBox`) plus any label whose text changed, and `loop` pushes only those boxes. Anything new that moves must call `markDirty`, or it leaves trails. Full-screen redraws now happen only when the landscape changes, and on the grid fallback.
 - Wrong colors: the 16 data wires are RGB565. The stock Guition init leaves the ST7701 in RGB666 (`0x3A` = `0x60`). Firmware now sends `0x50` instead. Do not switch that byte back.
 - Touch feels ignored: any touch should still extend the happy timer. If none register, try GT911 address 0x14 and `offset_rotation`.
 
@@ -156,7 +160,7 @@ ROM reported flash mode DIO. That is what this platform writes for QIO boards, a
 - 2026-10-07: Saved the sprite sheet as `/byte/sprites/0.bin`–`6.bin` on the NO NAME card. The board plays them after that card is inserted and it reboots.
 - 2026-10-07: Replaced those with the 12 labeled poses. Flying alternates the two flight frames, walking alternates the two step frames, and eating goes from bite to chew to finished.
 - 2026-10-07: Brought this plan up to date. Next human step is to move the NO NAME card into the TF slot and power-cycle the board.
-- 2026-10-07: Confirmed Wi-Fi. The board joined Wi-Fi. The first weather read was `0F clear` because the parser hit the units label. Parsing now starts at the `current` object.
+- 2026-10-07: Confirmed the board joins Wi-Fi. The first weather read was `0F clear` because the parser hit the units label. Parsing now starts at the `current` object.
 - 2026-10-07: Saved four 480×480 landscapes at `/byte/bg/morning.bin`, `afternoon.bin`, `evening.bin`, and `night.bin`. The board copies the one that matches the local hour once the card is in the TF slot.
 - 2026-10-07: Removed the description from the screen. Name, clock, date, weather, and caption use a large bold font on dark labels.
 - 2026-10-07: Split the labels onto their own rows so the name, clock, date, weather, and caption no longer overlap.
@@ -165,3 +169,8 @@ ROM reported flash mode DIO. That is what this platform writes for QIO boards, a
 - 2026-10-07: Rewrote the card pictures as 16-bit RGB565. Landscapes are exactly 480×480. Sprites are capped so they fit between the labels. Flying cycles six new poses in `/byte/sprites/12.bin` through `17.bin`.
 - 2026-10-07: Replaced the four landscapes with the new 16-bit scenes, scaled to 480×480 RGB565 on the card.
 - 2026-10-07: Last card check found sprites `0.bin`–`17.bin` plus morning, afternoon, and evening. `night.bin` was not on the card. The card was unplugged before it could be copied. Next step is to mount NO NAME again, add `night.bin`, then move the card to the TF slot.
+- 2026-10-07: The card was in the TF slot with `night.bin`. All 18 sprites and four landscapes loaded.
+- 2026-10-07: A C920 photo showed the picture washed out, almost white. Cause: card pixels are little-endian, but they were copied raw into the LovyanGFX sprite, which stores pixels byte-swapped. That turned dark blues into bright tan. Card pixels are now swapped at load, and the built-in art is swapped as it is drawn.
+- 2026-10-07: New layout. Clock and date are at top left, weather at top right, and name and caption at bottom left, each on a panel that dims the scene to a quarter, with a drop shadow on the text. Himop's flight band is now y 190–280. Flashed, and the photo confirms true color.
+- 2026-10-07: The screen was jumping. Cause: every frame copied the full 460 KB landscape and pushed the full 460 KB canvas, about 55 MB/s of PSRAM traffic. That starved the panel DMA, which reads the framebuffer from PSRAM. Now each frame restores and pushes only the box around Himop, his shadow, bubble, hearts, "z", and the kooker, plus labels whose text changed. Drifting sparks are off over landscapes, since they would dirty the whole screen. Himop now draws above the labels. A C920 clip at 6 fps showed no doubled labels or shifts; the only soft frames were camera refocus.
+- 2026-10-07: Added `README.md` with screen photos, the 18 sprites, the four landscapes, a flying-cycle GIF, and credit to Silas Rangel, who created Himop for his Creature Adventure Series. The images are in `docs/images/`. The sprite and landscape PNGs are converted from the card `.bin` files.
