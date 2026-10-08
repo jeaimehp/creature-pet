@@ -11,7 +11,7 @@ A small desk pet for the Guition ESP32-4848S040, a 4-inch 480×480 touch screen.
 Every screenshot here is a pixel-exact dump of the board's framebuffer (see [Screenshots](#screenshots)). Here's the real thing on the desk, photographed with a webcam:
 
 <p align="center">
-  <img src="docs/images/photo/on-the-desk.jpg" alt="Photo of the ESP32-4848S040 on a desk showing Himop soaring, with the time, date, and weather" width="60%">
+  <img src="docs/images/photo/on-the-desk.jpg" alt="Photo of the ESP32-4848S040 on a desk showing Himop enjoying a pet, with the time, date, and weather" width="60%">
 </p>
 
 ## Credit
