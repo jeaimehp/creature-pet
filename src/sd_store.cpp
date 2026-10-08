@@ -19,6 +19,77 @@ static void toSpriteOrder(uint16_t *px, size_t count) {
   for (size_t i = 0; i < count; ++i) px[i] = __builtin_bswap16(px[i]);
 }
 
+static bool isDark(uint16_t spritePx, int limit5, int limit6) {
+  const uint16_t c = __builtin_bswap16(spritePx);
+  return ((c >> 11) & 31) < limit5 && ((c >> 5) & 63) < limit6 && (c & 31) < limit5 + 1;
+}
+
+// Some poses kept the cut-out background where it was enclosed, such as the gap
+// between a wing and the body, so it draws as a black patch. Clear any large,
+// mostly solid near-black region from the mask, then its dark antialiased rim.
+// Thin dark lines like eye outlines are sparse in their box and stay.
+static int clearEnclosedGaps(const uint16_t *px, uint8_t *mask, int w, int h) {
+  const int n = w * h;
+  auto opaque = [&](int i) { return (mask[i >> 3] & (0x80 >> (i & 7))) != 0; };
+  auto clearBit = [&](int i) { mask[i >> 3] &= ~(0x80 >> (i & 7)); };
+  uint8_t *state = static_cast<uint8_t *>(heap_caps_calloc(n, 1, MALLOC_CAP_SPIRAM));  // 1 seen, 2 cleared
+  int32_t *stack = static_cast<int32_t *>(heap_caps_malloc((size_t)n * 4, MALLOC_CAP_SPIRAM));
+  int32_t *comp = static_cast<int32_t *>(heap_caps_malloc((size_t)n * 4, MALLOC_CAP_SPIRAM));
+  int cleared = 0;
+  if (state && stack && comp) {
+    for (int start = 0; start < n; ++start) {
+      if (state[start] || !opaque(start) || !isDark(px[start], 5, 10)) continue;
+      int top = 0, count = 0;
+      int minX = w, minY = h, maxX = 0, maxY = 0;
+      stack[top++] = start;
+      state[start] = 1;
+      while (top) {
+        const int i = stack[--top];
+        comp[count++] = i;
+        const int x = i % w, y = i / w;
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+        const int nb[4] = {x > 0 ? i - 1 : -1, x < w - 1 ? i + 1 : -1, y > 0 ? i - w : -1, y < h - 1 ? i + w : -1};
+        for (int j : nb) {
+          if (j < 0 || state[j] || !opaque(j) || !isDark(px[j], 5, 10)) continue;
+          state[j] = 1;
+          stack[top++] = j;
+        }
+      }
+      const int boxArea = (maxX - minX + 1) * (maxY - minY + 1);
+      if (count < 300 || count * 10 < boxArea * 4) continue;
+      for (int k = 0; k < count; ++k) {
+        clearBit(comp[k]);
+        state[comp[k]] = 2;
+      }
+      cleared += count;
+    }
+    // Two passes over the rim: dim pixels touching a cleared one go too.
+    for (int pass = 0; pass < 2 && cleared; ++pass) {
+      int rim = 0;
+      for (int i = 0; i < n; ++i) {
+        if (!opaque(i) || !isDark(px[i], 12, 24)) continue;
+        const int x = i % w, y = i / w;
+        if ((x > 0 && state[i - 1] == 2) || (x < w - 1 && state[i + 1] == 2) || (y > 0 && state[i - w] == 2) ||
+            (y < h - 1 && state[i + w] == 2)) {
+          comp[rim++] = i;
+        }
+      }
+      for (int k = 0; k < rim; ++k) {
+        clearBit(comp[k]);
+        state[comp[k]] = 2;
+      }
+      cleared += rim;
+    }
+  }
+  heap_caps_free(state);
+  heap_caps_free(stack);
+  heap_caps_free(comp);
+  return cleared;
+}
+
 static void copyTrimmed(char *dst, size_t dstLen, const String &src) {
   size_t start = 0;
   while (start < src.length() && (src[start] == ' ' || src[start] == '\t' || src[start] == '\r')) {
@@ -153,6 +224,8 @@ bool loadHimopSprites(HimopCardFrame *frames, int count) {
     }
     file.close();
     toSpriteOrder(px, (size_t)w * (size_t)h);
+    const int gaps = clearEnclosedGaps(px, mask, w, h);
+    if (gaps) Serial.printf("sprite %d: cleared %d px of enclosed background\n", i, gaps);
     frames[i].px = px;
     frames[i].mask = mask;
     frames[i].w = w;

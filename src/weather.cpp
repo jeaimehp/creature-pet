@@ -9,6 +9,7 @@
 #endif
 
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 
@@ -30,6 +31,12 @@ static WeatherKind gKind = kWeatherNone;
 static bool gHaveWeather = false;
 static uint32_t gLastFetch = 0;
 static uint32_t gLastWifiTry = 0;
+static bool gAnnounced = false;
+static bool gPaused = false;
+
+// Credentials saved from the on-screen menu win over secrets.h.
+static char gSsid[33] = "";
+static char gPass[65] = "";
 
 const char *weatherCurrent() { return gNow; }
 const char *weatherDate() { return gDate; }
@@ -129,35 +136,88 @@ static void refreshClock() {
   strftime(gDate, sizeof(gDate), "%a %b %d", &nowTm);
 }
 
-void weatherBegin() {
-  if (WIFI_SSID[0] == '\0') {
-    snprintf(gNow, sizeof(gNow), "no wifi");
-    Serial.println("wifi secrets missing");
-    return;
-  }
+static void connectWifi() {
   WiFi.mode(WIFI_STA);
   WiFi.setSleep(false);
-  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  WiFi.disconnect();
+  WiFi.begin(gSsid, gPass);
   gLastWifiTry = millis();
-  Serial.printf("wifi connecting to %s\n", WIFI_SSID);
+  gAnnounced = false;
+  Serial.printf("wifi connecting to %s\n", gSsid);
+}
+
+void weatherBegin() {
+  Preferences prefs;
+  if (prefs.begin("himop", true)) {
+    prefs.getString("ssid", gSsid, sizeof(gSsid));
+    prefs.getString("pass", gPass, sizeof(gPass));
+    prefs.end();
+  }
+  if (gSsid[0] == '\0') {
+    strncpy(gSsid, WIFI_SSID, sizeof(gSsid) - 1);
+    strncpy(gPass, WIFI_PASS, sizeof(gPass) - 1);
+  }
+  if (gSsid[0] == '\0') {
+    snprintf(gNow, sizeof(gNow), "no wifi");
+    Serial.println("wifi not set, use the menu");
+    return;
+  }
+  connectWifi();
+}
+
+void weatherSetWifi(const char *ssid, const char *pass) {
+  strncpy(gSsid, ssid, sizeof(gSsid) - 1);
+  gSsid[sizeof(gSsid) - 1] = '\0';
+  strncpy(gPass, pass, sizeof(gPass) - 1);
+  gPass[sizeof(gPass) - 1] = '\0';
+  Preferences prefs;
+  if (prefs.begin("himop", false)) {
+    prefs.putString("ssid", gSsid);
+    prefs.putString("pass", gPass);
+    prefs.end();
+  }
+  gPaused = false;
+  if (!gHaveWeather) snprintf(gNow, sizeof(gNow), "wifi ...");
+  connectWifi();
+}
+
+const char *weatherSsid() { return gSsid; }
+
+WifiState weatherWifiState() {
+  if (gSsid[0] == '\0') return kWifiUnset;
+  if (WiFi.status() == WL_CONNECTED) return kWifiConnected;
+  return kWifiConnecting;
+}
+
+String weatherIp() { return WiFi.localIP().toString(); }
+
+void weatherPauseWifi() {
+  gPaused = true;
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+}
+
+void weatherResumeWifi() {
+  gPaused = false;
+  if (gSsid[0] != '\0') connectWifi();
 }
 
 void weatherTick(uint32_t now) {
-  if (WIFI_SSID[0] == '\0') return;
+  if (gSsid[0] == '\0' || gPaused) return;
   if (WiFi.status() != WL_CONNECTED) {
     if (!gHaveWeather) snprintf(gNow, sizeof(gNow), "wifi ...");
-    if (now - gLastWifiTry > 15000) {
+    // Signed: connectWifi() may stamp a time later than this tick's `now`.
+    if ((int32_t)(now - gLastWifiTry) > 15000) {
       WiFi.disconnect();
-      WiFi.begin(WIFI_SSID, WIFI_PASS);
+      WiFi.begin(gSsid, gPass);
       gLastWifiTry = now;
       Serial.println("wifi retry");
     }
     return;
   }
 
-  static bool announced = false;
-  if (!announced) {
-    announced = true;
+  if (!gAnnounced) {
+    gAnnounced = true;
     configTzTime("EST5EDT,M3.2.0,M11.1.0", "pool.ntp.org", "time.nist.gov");
     Serial.printf("wifi connected %s\n", WiFi.localIP().toString().c_str());
     if (!gHaveWeather) snprintf(gNow, sizeof(gNow), "weather ...");

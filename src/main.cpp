@@ -1,13 +1,17 @@
 #include "himop_art.h"
-#include "lgfx_board.hpp"
+#define LGFX_USE_V1
+#include <LovyanGFX.hpp>
+
+#include "board.hpp"
+#include "display_rgb.h"
 #include "sd_store.h"
 #include "weather.h"
+#include "wifi_menu.h"
 
 #include <math.h>
 #include <string.h>
 
-static LGFX display;
-static LGFX_Sprite canvas(&display);
+static LGFX_Sprite canvas;
 
 static constexpr int W = 480;
 static constexpr int H = 480;
@@ -23,6 +27,11 @@ static bool haveCardSprites = false;
 static uint16_t *dayBg[4] = {};
 static bool haveBackgrounds = false;
 static int himopSpriteH = 220;
+
+// Himop naps only after 5 minutes without a touch. Each nap lasts 30 minutes,
+// and a touch wakes him (pollTouch resets buddy.until).
+static constexpr uint32_t kNapAfterMs = 5UL * 60UL * 1000UL;
+static constexpr uint32_t kNapMs = 30UL * 60UL * 1000UL;
 
 static uint32_t rngState = 0xC0FFEE01;
 
@@ -99,7 +108,8 @@ enum Action : uint8_t {
   kGlitchAct,
   kFly,
   kGraze,
-  kFlee
+  kFlee,
+  kCome  // heading to where he was tapped
 };
 
 enum EyeStyle : uint8_t {
@@ -124,6 +134,7 @@ static Mote motes[kMotes];
 struct Motion {
   float x, y;
   float tx, ty;
+  float z, tz;  // depth: 0 far away, 1 close up
   float anchorX, anchorY;
   uint8_t action;
   uint8_t face;
@@ -168,15 +179,17 @@ static uint32_t lastPetMs = 0;
 static uint32_t bootMs = 0;
 static bool seenTouch = false;
 
-static bool isHappy(uint32_t now) {
-  return seenTouch && (now - lastPetMs) < 3200;
-}
+// A tap calls Himop over (kCome): he finishes waking if he was napping, walks
+// if he was on the ground, otherwise flies. Only when he arrives does he enjoy
+// the pet, with the happy pose and hearts, until enjoyUntil.
+static uint32_t enjoyUntil = 0;
+static uint32_t wakeUntil = 0;
+static uint32_t lastHeartMs = 0;
+static bool comeWalking = false;
+static constexpr float kComeFlyStep = 4.0f;
+static constexpr float kComeWalkStep = 1.8f;
 
-static bool isSleepy(uint32_t now) {
-  if (isHappy(now)) return false;
-  uint32_t idle = seenTouch ? (now - lastPetMs) : (now - bootMs);
-  return idle > 22000;
-}
+static bool isHappy(uint32_t now) { return (int32_t)(enjoyUntil - now) > 0; }
 
 static void spawnSpark(Mote &m) {
   m.kind = 0;
@@ -393,15 +406,34 @@ static void layoutLabels(Label labels[kLabelCount]) {
   const lgfx::GFXfont *hud = &fonts::FreeSansBold18pt7b;
   const lgfx::GFXfont *small = &fonts::FreeSansBold12pt7b;
   const lgfx::GFXfont *title = &fonts::FreeSansBold24pt7b;
+  // Hidden labels get empty text, so they take no space and the others close up.
+  auto pick = [](uint8_t flag, const char *text) { return menuShows(flag) ? text : ""; };
   int y = kEdge;
-  const int timeH = placeLabel(labels[kLabelTime], weatherTime(), kEdge, y, top_left, hud, white);
+  const int timeH = placeLabel(labels[kLabelTime], pick(kShowTime, weatherTime()), kEdge, y, top_left, hud, white);
   if (timeH > 0) y += timeH + kGap;
-  placeLabel(labels[kLabelDate], weatherDate(), kEdge, y, top_left, small, soft);
-  placeLabel(labels[kLabelWeather], weatherCurrent(), W - kEdge, kEdge, top_right, hud, white);
+  placeLabel(labels[kLabelDate], pick(kShowDate, weatherDate()), kEdge, y, top_left, small, soft);
+  placeLabel(labels[kLabelWeather], pick(kShowWeather, weatherCurrent()), W - kEdge, kEdge, top_right, hud,
+             white);
   y = H - kEdge;
-  y -= placeLabel(labels[kLabelCaption], buddy.caption ? buddy.caption : "soaring", kEdge, y,
-                  bottom_left, small, soft) + kGap;
-  placeLabel(labels[kLabelName], petName, kEdge, y, bottom_left, title, white);
+  const int captionH = placeLabel(labels[kLabelCaption], pick(kShowCaption, buddy.caption ? buddy.caption : "soaring"),
+                                  kEdge, y, bottom_left, small, soft);
+  if (captionH > 0) y -= captionH + kGap;
+  placeLabel(labels[kLabelName], pick(kShowName, petName), kEdge, y, bottom_left, title, white);
+}
+
+// Lower-right menu button: three bars on a shaded panel. Opens Wi-Fi settings.
+static void drawMenuButton() {
+  shadePanel(kMenuButtonX, kMenuButtonY, kMenuButtonSize, kMenuButtonSize, 10);
+  const uint16_t bar = canvas.color565(255, 255, 255);
+  const int x = kMenuButtonX + 15;
+  for (int i = 0; i < 3; ++i) {
+    canvas.fillRoundRect(x, kMenuButtonY + 17 + i * 11, kMenuButtonSize - 30, 5, 2, bar);
+  }
+}
+
+static bool inMenuButton(int x, int y) {
+  constexpr int kSlop = 10;
+  return x >= kMenuButtonX - kSlop && y >= kMenuButtonY - kSlop;
 }
 
 // Draws text on a shaded panel, honoring the canvas clip rect.
@@ -469,56 +501,219 @@ static void drawSpeech(int hx, int hy) {
   }
 }
 
+// Exploring: fly off one side, linger out of view, then come back on screen.
+// Peeking happens while away: ease part way in from an edge, hold, back out.
+enum Explore : uint8_t {
+  kExploreNone,
+  kExploreOut,
+  kExploreAway,
+  kExploreBack,
+  kPeekIn,
+  kPeekHold,
+  kPeekOut,
+};
+static uint8_t peeksLeft = 0;
+static uint8_t peekEdge = 0;
+static constexpr float kPeekStep = 2.0f;
+static constexpr int kPeekInset = 40;  // center this far past the edge: about a third shows
+static uint8_t exploreStage = kExploreNone;
+static uint32_t exploreUntil = 0;
+static constexpr int kOffscreen = 170;   // past a side edge: the widest pose is 300 px
+static constexpr int kOffscreenY = 130;  // past the top or bottom: the tallest pose is 190 px
+
+enum Edge : uint8_t { kEdgeLeft, kEdgeRight, kEdgeTop, kEdgeBottom };
+
+// A point just out of view past the given edge, at a random spot along it.
+static void offscreenPoint(uint8_t edge, float *x, float *y) {
+  switch (edge) {
+    case kEdgeLeft: *x = -kOffscreen; *y = (float)rndRange(kMinY, kMaxY); break;
+    case kEdgeRight: *x = W + kOffscreen; *y = (float)rndRange(kMinY, kMaxY); break;
+    case kEdgeTop: *x = (float)rndRange(kMinX, kMaxX); *y = -kOffscreenY; break;
+    default: *x = (float)rndRange(kMinX, kMaxX); *y = H + kOffscreenY; break;
+  }
+}
+// Flight speeds in pixels per frame (about 30 frames a second).
+static constexpr float kSoarStep = 3.2f;
+static constexpr float kExploreStep = 4.5f;
+
+// Depth sets his size: half size far away, full size close up.
+static constexpr float kFarScale = 0.5f;
+static constexpr float kNearScale = 1.0f;
+static constexpr float kGroundDepth = 0.8f;
+static constexpr float kDepthStep = 0.006f;  // per frame, so a full change takes about 5 s
+
+static float himopScale() { return kFarScale + (kNearScale - kFarScale) * buddy.z; }
+
+// Sets an on-screen target and a new random depth to drift toward.
 static void placeTarget(int x, int y) {
   buddy.tx = (float)clampi(x, kMinX, kMaxX);
   buddy.ty = (float)clampi(y, kMinY, kMaxY);
+  buddy.tz = rndRange(0, 100) / 100.0f;
+}
+
+// Behaviors pickNext can choose. Serial "act <name>" forces the next one.
+enum Choice : int8_t { kChooseNone = -1, kChooseNap, kChooseSoar, kChooseSoarUp, kChooseExplore,
+                       kChooseWalk, kChooseKooker, kChooseGraze };
+static int8_t forcedChoice = kChooseNone;
+
+// Petting keeps him around: the first tap holds him on screen for 30 s, each
+// further tap adds 10 s, up to 5 minutes. Meanwhile he skips off-screen trips.
+static uint32_t stayUntil = 0;
+static constexpr uint32_t kStayFirstMs = 30000;
+static constexpr uint32_t kStayPerTapMs = 10000;
+static constexpr uint32_t kStayMaxMs = 5UL * 60UL * 1000UL;
+
+static void addStay(uint32_t now) {
+  if ((int32_t)(stayUntil - now) <= 0) {
+    stayUntil = now + kStayFirstMs;
+  } else {
+    stayUntil += kStayPerTapMs;
+    if (stayUntil - now > kStayMaxMs) stayUntil = now + kStayMaxMs;
+  }
+}
+
+static int8_t rollChoice(uint32_t now) {
+  if ((now - lastPetMs) > kNapAfterMs) return kChooseNap;
+  const int roll = rndRange(0, 7);
+  if (roll <= 5) {
+    // Half of flights leave the screen: soaring climbs out the top, exploring
+    // heads out a side or down the bottom.
+    const int trip = rndRange(0, 5);
+    if (trip < 3 || (int32_t)(stayUntil - now) > 0) return kChooseSoar;
+    return trip == 3 ? kChooseSoarUp : kChooseExplore;
+  }
+  if (roll == 6) return kChooseWalk;
+  return (rnd() % 3) == 0 ? kChooseKooker : kChooseGraze;
 }
 
 static void pickNext(uint32_t now) {
+  exploreStage = kExploreNone;
   buddy.anchorX = buddy.x;
   buddy.anchorY = buddy.y;
   buddy.winkLeft = (rnd() & 1) != 0;
 
-  int roll = rndRange(0, 9);
-  uint32_t dur = 5000;
-  if (roll <= 5) {
+  const int8_t choice = forcedChoice != kChooseNone ? forcedChoice : rollChoice(now);
+  forcedChoice = kChooseNone;
+
+  // Everything but a flight happens in his play area (fully on screen). If he's
+  // outside it, he flies in first, and the choice waits until he arrives.
+  const bool away = buddy.x < kMinX || buddy.x > kMaxX || buddy.y < kMinY || buddy.y > kMaxY;
+  const bool flight = choice == kChooseSoar || choice == kChooseSoarUp || choice == kChooseExplore;
+  const bool offscreen = buddy.x < 0 || buddy.x > W || buddy.y < 0 || buddy.y > H;
+  if (away && choice == kChooseNap && offscreen) {
+    // Sleepy and out of view: come back on foot. He's unseen, so start him at
+    // ground level just past a side edge.
+    forcedChoice = choice;
+    if (buddy.x >= 0 && buddy.x <= W) buddy.x = (rnd() & 1) ? -kOffscreen : W + kOffscreen;
+    buddy.y = kMaxY - 8;
+    buddy.z = kGroundDepth;
+    buddy.action = kWander;
+    buddy.face = kNeutral;
+    buddy.caption = "walking back";
+    placeTarget(rndRange(kMinX, kMaxX), kMaxY - 8);
+    buddy.tz = kGroundDepth;
+    exploreStage = kExploreBack;  // ends on arrival, then he naps
+    buddy.until = now + 90000;
+    return;
+  }
+  if (away && !flight) {
+    forcedChoice = choice;
     buddy.action = kFly;
     buddy.face = kNeutral;
     buddy.caption = "soaring";
     placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMaxY));
-    dur = (uint32_t)rndRange(4200, 7000);
-  } else if (roll <= 7) {
-    buddy.action = kYawn;
-    buddy.face = kSleepy;
-    buddy.caption = "napping";
-    placeTarget((int)buddy.x, (int)buddy.y + 10);
-    dur = (uint32_t)rndRange(5000, 9000);
-  } else if (roll == 8) {
-    buddy.action = kWander;
-    buddy.face = kNeutral;
-    buddy.caption = "on foot";
-    placeTarget(rndRange(kMinX, kMaxX), kMaxY - 8);
-    dur = (uint32_t)rndRange(2800, 4200);
-  } else if ((rnd() % 3) == 0) {
-    buddy.action = kFlee;
-    buddy.face = kSurprise;
-    buddy.caption = "kooker!";
-    bool fromLeft = buddy.x >= (kMinX + kMaxX) / 2;
-    kookerX = fromLeft ? 28 : W - 28;
-    kookerUntil = now + 2800;
-    placeTarget(fromLeft ? kMaxX : kMinX, rndRange(kMinY, kMinY + 40));
-    showSpeech(now, "ROW, ROW, ROW", 2800);
-    dur = 2800;
-  } else {
-    buddy.action = kGraze;
-    buddy.face = kNeutral;
-    buddy.caption = "nibbling";
-    placeTarget(rndRange(kMinX, kMaxX), kMaxY);
-    dur = (uint32_t)rndRange(2800, 4600);
+    exploreStage = kExploreBack;  // ends on arrival, then pickNext runs the choice
+    buddy.until = now + 90000;
+    return;
+  }
+
+  uint32_t dur = 5000;
+  switch (choice) {
+    case kChooseNap:
+      buddy.action = kYawn;
+      buddy.face = kSleepy;
+      buddy.caption = "napping";
+      placeTarget((int)buddy.x, (int)buddy.y + 10);
+      buddy.tz = buddy.z;  // curl up where he is
+      dur = kNapMs;
+      break;
+    case kChooseSoarUp:
+    case kChooseExplore: {
+      // Ends once he's back on screen (updateBuddy).
+      const bool soarUp = choice == kChooseSoarUp;
+      buddy.action = kFly;
+      buddy.face = kNeutral;
+      buddy.caption = soarUp ? "soaring" : "exploring";
+      exploreStage = kExploreOut;
+      peeksLeft = (uint8_t)rndRange(0, 2);
+      const uint8_t edge = soarUp ? kEdgeTop : (uint8_t)rndRange(0, 2) == 2 ? kEdgeBottom : (uint8_t)rndRange(0, 1);
+      offscreenPoint(edge, &buddy.tx, &buddy.ty);
+      buddy.tz = rndRange(0, 100) / 100.0f;
+      dur = 90000;
+      break;
+    }
+    case kChooseWalk:
+      buddy.action = kWander;
+      buddy.face = kNeutral;
+      buddy.caption = "on foot";
+      placeTarget(rndRange(kMinX, kMaxX), kMaxY - 8);
+      buddy.tz = kGroundDepth;
+      dur = (uint32_t)rndRange(2800, 4200);
+      break;
+    case kChooseKooker: {
+      buddy.action = kFlee;
+      buddy.face = kSurprise;
+      buddy.caption = "kooker!";
+      const bool fromLeft = buddy.x >= (kMinX + kMaxX) / 2;
+      kookerX = fromLeft ? 50 : W - 50;  // far enough in that the "kooker" label fits
+      kookerUntil = now + 2800;
+      placeTarget(fromLeft ? kMaxX : kMinX, rndRange(kMinY, kMinY + 40));
+      showSpeech(now, "ROW, ROW, ROW", 2800);
+      dur = 2800;
+      break;
+    }
+    case kChooseGraze:
+      buddy.action = kGraze;
+      buddy.face = kNeutral;
+      buddy.caption = "nibbling";
+      placeTarget(rndRange(kMinX, kMaxX), kMaxY);
+      buddy.tz = kGroundDepth;
+      dur = (uint32_t)rndRange(2800, 4600);
+      break;
+    default:
+      buddy.action = kFly;
+      buddy.face = kNeutral;
+      buddy.caption = "soaring";
+      placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMaxY));
+      dur = (uint32_t)rndRange(4200, 7000);
+      break;
   }
 
   buddy.until = now + dur;
-  Serial.printf("action %u face %u\n", buddy.action, buddy.face);
+  Serial.printf("action %u face %u %s\n", buddy.action, buddy.face, buddy.caption);
+}
+
+static void spawnHearts(uint32_t now) {
+  if (now - lastHeartMs < 250) return;
+  lastHeartMs = now;
+  int spawned = 0;
+  for (int i = 0; i < kMotes && spawned < 2; ++i) {
+    if (motes[i].kind == 1 && motes[i].life > 0) continue;
+    if (motes[i].life > 30 && motes[i].kind == 0) continue;
+    spawnHeart(motes[i], buddy.x, buddy.y - 40);
+    spawned++;
+  }
+}
+
+static void startEnjoying(uint32_t now) {
+  buddy.action = kIdle;
+  buddy.face = kHappy;
+  buddy.caption = "enjoys that";
+  enjoyUntil = now + reactionMs;
+  buddy.until = enjoyUntil;
+  lastHeartMs = 0;
+  spawnHearts(now);
+  Serial.println("pet arrived, enjoying");
 }
 
 static void updateBuddy(uint32_t now) {
@@ -527,10 +722,23 @@ static void updateBuddy(uint32_t now) {
   if (isHappy(now)) buddy.face = kHappy;
 
   float step = 0.0f;
-  if (buddy.action == kFly) step = 1.7f;
+  if (buddy.action == kFly) {
+    if (exploreStage == kExploreNone) step = kSoarStep;
+    else if (exploreStage == kPeekHold) step = 0.0f;
+    else if (exploreStage == kPeekIn || exploreStage == kPeekOut) step = kPeekStep;
+    else step = kExploreStep;
+  }
   else if (buddy.action == kFlee) step = 4.0f;
   else if (buddy.action == kGraze) step = 1.0f;
-  else if (buddy.action == kWander) step = 0.65f;
+  else if (buddy.action == kWander) step = exploreStage == kExploreBack ? kComeWalkStep : 0.65f;
+  else if (buddy.action == kCome) {
+    if ((int32_t)(now - wakeUntil) < 0) {
+      step = 0.0f;  // still curled up, waking
+    } else {
+      if (buddy.face == kSleepy) buddy.face = kNeutral;
+      step = comeWalking ? kComeWalkStep : kComeFlyStep;
+    }
+  }
 
   if (step > 0.0f) {
     float dx = buddy.tx - buddy.x;
@@ -539,13 +747,61 @@ static void updateBuddy(uint32_t now) {
     if (dist > step) {
       buddy.x += dx / dist * step;
       buddy.y += dy / dist * step;
-    } else if (buddy.action == kFly && (buddy.until - now) > 800) {
+    } else if (buddy.action == kCome) {
+      startEnjoying(now);
+    } else if (buddy.action == kFly && exploreStage == kExploreOut) {
+      exploreStage = kExploreAway;
+      exploreUntil = now + (uint32_t)rndRange(1000, 3000);
+    } else if (buddy.action == kFly && exploreStage == kPeekIn) {
+      exploreStage = kPeekHold;
+      exploreUntil = now + (uint32_t)rndRange(2000, 4000);
+      // Face into the screen while holding: he looks the way he'd travel.
+      if (peekEdge == kEdgeLeft) buddy.tx = buddy.x + 20;
+      else if (peekEdge == kEdgeRight) buddy.tx = buddy.x - 20;
+    } else if (buddy.action == kFly && exploreStage == kPeekOut) {
+      exploreStage = kExploreAway;
+      exploreUntil = now + (uint32_t)rndRange(1000, 3000);
+    } else if (exploreStage == kExploreBack) {  // flew or walked back in
+      exploreStage = kExploreNone;
+      buddy.until = now;
+    } else if (buddy.action == kFly && exploreStage == kExploreNone && (buddy.until - now) > 800) {
       placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMaxY));
     }
   }
 
-  buddy.x = fminf(fmaxf(buddy.x, (float)kMinX), (float)kMaxX);
-  buddy.y = fminf(fmaxf(buddy.y, (float)kMinY), (float)kMaxY);
+  const float dz = buddy.tz - buddy.z;
+  buddy.z += fminf(fmaxf(dz, -kDepthStep), kDepthStep);
+
+  // Done peeking: slip back out the same edge.
+  if (exploreStage == kPeekHold && (int32_t)(now - exploreUntil) >= 0) {
+    offscreenPoint(peekEdge, &buddy.tx, &buddy.ty);
+    if (peekEdge == kEdgeLeft || peekEdge == kEdgeRight) buddy.ty = buddy.y;
+    else buddy.tx = buddy.x;
+    exploreStage = kPeekOut;
+  }
+
+  // Out of view: sometimes peek in, otherwise come back in from any edge.
+  if (exploreStage == kExploreAway && (int32_t)(now - exploreUntil) >= 0 && peeksLeft > 0 && (rnd() & 1)) {
+    peeksLeft--;
+    peekEdge = (uint8_t)rndRange(0, 3);
+    offscreenPoint(peekEdge, &buddy.x, &buddy.y);
+    buddy.tx = buddy.x;
+    buddy.ty = buddy.y;
+    switch (peekEdge) {
+      case kEdgeLeft: buddy.tx = -kPeekInset; break;
+      case kEdgeRight: buddy.tx = W + kPeekInset; break;
+      case kEdgeTop: buddy.ty = -kPeekInset / 2; break;
+      default: buddy.ty = H + kPeekInset / 2; break;
+    }
+    buddy.caption = "peeking";
+    exploreStage = kPeekIn;
+    Serial.printf("peek from edge %u\n", peekEdge);
+  } else if (exploreStage == kExploreAway && (int32_t)(now - exploreUntil) >= 0) {
+    offscreenPoint((uint8_t)rndRange(0, 3), &buddy.x, &buddy.y);
+    placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMaxY));
+    if (strcmp(buddy.caption, "peeking") == 0) buddy.caption = "exploring";
+    exploreStage = kExploreBack;
+  }
 }
 
 static void drawFace(int hx, int hy, int lookX, int lookY, float blinkOpen, uint32_t now) {
@@ -749,31 +1005,39 @@ static void drawSunglasses(int hx, int hy) {
 
 // Sprite buffers hold byte-swapped RGB565. Card frames are swapped at load;
 // the built-in art is native order, so it passes swap = true.
-static void blitHimop(int cx, int cy, const HimopFrame &frame, bool mirror, bool swap) {
+// Draws a pose scaled about its center (nearest neighbor), optionally mirrored.
+static void blitHimop(int cx, int cy, const HimopFrame &frame, bool mirror, bool swap, float scale) {
   uint16_t *dst = (uint16_t *)canvas.getBuffer();
   const int stride = canvas.width();
-  const int x0 = cx - frame.w / 2;
-  const int y0 = cy - frame.h / 2;
-  for (int y = 0; y < frame.h; ++y) {
+  const int dw = frame.w * scale + 0.5f > 1 ? (int)(frame.w * scale + 0.5f) : 1;
+  const int dh = frame.h * scale + 0.5f > 1 ? (int)(frame.h * scale + 0.5f) : 1;
+  const int x0 = cx - dw / 2;
+  const int y0 = cy - dh / 2;
+  const uint32_t stepX = ((uint32_t)frame.w << 16) / dw;
+  const uint32_t stepY = ((uint32_t)frame.h << 16) / dh;
+  for (int y = 0; y < dh; ++y) {
     const int dy = y0 + y;
     if ((unsigned)dy >= (unsigned)H) continue;
-    for (int x = 0; x < frame.w; ++x) {
-      const int i = y * frame.w + x;
-      if ((frame.mask[i >> 3] & (0x80 >> (i & 7))) == 0) continue;
-      const int dx = x0 + (mirror ? (frame.w - 1 - x) : x);
+    const int row = (int)((y * stepY) >> 16) * frame.w;
+    for (int x = 0; x < dw; ++x) {
+      const int dx = x0 + x;
       if ((unsigned)dx >= (unsigned)W) continue;
+      int sx = (int)((x * stepX) >> 16);
+      if (mirror) sx = frame.w - 1 - sx;
+      const int i = row + sx;
+      if ((frame.mask[i >> 3] & (0x80 >> (i & 7))) == 0) continue;
       dst[dy * stride + dx] = swap ? __builtin_bswap16(frame.px[i]) : frame.px[i];
     }
   }
-  markDirty(x0, y0, frame.w, frame.h);
-  himopCrownX = mirror ? x0 + frame.w - frame.w / 5 : x0 + frame.w / 5;
-  himopCrownY = y0 + frame.h / 7;
-  himopSpriteH = frame.h;
+  markDirty(x0, y0, dw, dh);
+  himopCrownX = mirror ? x0 + dw - dw / 5 : x0 + dw / 5;
+  himopCrownY = y0 + dh / 7;
+  himopSpriteH = dh;
 }
 
-static void blitRaw(int cx, int cy, const uint16_t *px, const uint8_t *mask, int w, int h, bool mirror) {
-  HimopFrame frame = {px, mask, w, h};
-  blitHimop(cx, cy, frame, mirror, false);
+static void blitCard(int cx, int cy, const HimopCardFrame &f, bool mirror) {
+  HimopFrame frame = {f.px, f.mask, f.w, f.h};
+  blitHimop(cx, cy, frame, mirror, false, himopScale());
 }
 
 static void drawHimop(int hx, int hy, uint32_t now) {
@@ -786,24 +1050,23 @@ static void drawHimop(int hx, int hy, uint32_t now) {
     index = 8;
   } else if (isHappy(now) || buddy.face == kHappy) {
     index = 7;
-  } else if (buddy.action == kWander) {
+  } else if (buddy.action == kWander || (buddy.action == kCome && comeWalking)) {
     index = ((now / 220) & 1) ? 5 : 4;
   } else if (buddy.action == kGraze) {
     const uint32_t left = buddy.until > now ? buddy.until - now : 0;
     if (left < 900) index = 11;
     else index = ((now / 280) & 1) ? 10 : 9;
-  } else if (buddy.action == kFly) {
+  } else if (buddy.action == kFly || buddy.action == kCome) {
     index = 12 + (int)((now / 120) % 6);
   } else {
     index = ((now / 900) & 1) ? 1 : 0;
   }
 
   if (haveCardSprites && index < 18 && cardFrames[index].px != nullptr) {
-    blitRaw(hx, hy, cardFrames[index].px, cardFrames[index].mask, cardFrames[index].w, cardFrames[index].h,
-            mirror);
+    blitCard(hx, hy, cardFrames[index], mirror);
   } else {
     const HimopFrame &frame = curled ? himopNap : himopFly;
-    blitHimop(hx, hy, frame, mirror, true);
+    blitHimop(hx, hy, frame, mirror, true, himopScale());
   }
 }
 
@@ -829,12 +1092,16 @@ static void restoreBox(const Box &b, const uint16_t *scene, const Label labels[k
   for (int y = b.y0; y < b.y1; ++y) memcpy(buf + y * W + b.x0, scene + y * W + b.x0, rowBytes);
   canvas.setClipRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
   for (int i = 0; i < kLabelCount; ++i) drawLabel(labels[i]);
+  drawMenuButton();
   canvas.clearClipRect();
 }
 
 static void addPush(const Box &b) {
   if (!boxEmpty(b) && pushCount < kMaxPush) pushBoxes[pushCount++] = b;
 }
+
+// Set when something else (the menu) has drawn over the canvas.
+static bool needFullRedraw = true;
 
 static void drawBuddy(uint32_t now) {
   static Box prevDyn = {0, 0, 0, 0};
@@ -861,8 +1128,9 @@ static void drawBuddy(uint32_t now) {
   if (scene == nullptr) {
     drawGrid(now);
     for (int i = 0; i < kLabelCount; ++i) drawLabel(labels[i]);
+    drawMenuButton();
     addPush(whole);
-  } else if (scene != shownScene) {
+  } else if (scene != shownScene || needFullRedraw) {
     restoreBox(whole, scene, labels);
     addPush(whole);
   } else {
@@ -877,25 +1145,28 @@ static void drawBuddy(uint32_t now) {
     }
   }
   shownScene = scene;
+  needFullRedraw = false;
   memcpy(shown, labels, sizeof(shown));
   dynBox = {0, 0, 0, 0};
 
-  int bob = sleepy ? (int)(sinf(now * 0.0011f) * 2.0f) : (int)(sinf(now * 0.0022f) * 5.0f);
+  // Asleep, he lies still; a 2 px bob in whole-pixel steps reads as jitter.
+  int bob = sleepy ? 0 : (int)(sinf(now * 0.0022f) * 5.0f);
   int hop = 0;
-  if (buddy.action == kFly || buddy.action == kFlee) {
+  const bool airborne = buddy.action == kFly || buddy.action == kFlee || (buddy.action == kCome && !comeWalking);
+  if (airborne) {
     hop = 6 + (int)(sinf(now * 0.0032f) * 4.0f);
   }
   if (happy) hop += 6;
 
-  int sway = (buddy.action == kFly || buddy.action == kFlee) ? (int)(sinf(now * 0.002f) * 4.0f) : 0;
+  int sway = airborne ? (int)(sinf(now * 0.002f) * 4.0f) : 0;
 
   const int cx = (int)buddy.x;
   const int cy = (int)buddy.y - hop + bob;
   const int hx = cx + sway;
   const int hy = cy;
 
-  int shadowRx = 46 - hop / 5;
-  if (shadowRx < 22) shadowRx = 22;
+  int shadowRx = (int)((46 - hop / 5) * himopScale());
+  if (shadowRx < 14) shadowRx = 14;
   const int shadowY = hy + himopSpriteH / 2 - 6;
   canvas.fillEllipse(cx, shadowY, shadowRx, 8, canvas.color565(8, 8, 12));
   markDirty(cx - shadowRx - 1, shadowY - 9, shadowRx * 2 + 3, 19);
@@ -940,8 +1211,9 @@ static void drawBuddy(uint32_t now) {
 
   drawSpeech(hx, hy);
 
-  if (sleepy && ((now / 600) % 2 == 0)) {
-    const int zy = hy - 96 - (int)((now / 40) % 14);
+  if (sleepy) {
+    // One "z" rises 40 px every 2.4 s, then starts again.
+    const int zy = hy - 70 - (int)((now % 2400) * 40 / 2400);
     canvas.setFont(&fonts::FreeSansBold18pt7b);
     canvas.setTextDatum(middle_center);
     canvas.setTextColor(canvas.color565(255, 255, 255));
@@ -953,33 +1225,44 @@ static void drawBuddy(uint32_t now) {
   prevDyn = dynBox;
 }
 
-static void pollTouch(uint32_t now) {
-  int32_t x = 0;
-  int32_t y = 0;
-  if (!display.getTouch(&x, &y)) return;
-  bool freshPet = (now - lastPetMs) > 300;
+static void petTouch(uint32_t now, int x, int y, bool newTap) {
   lastPetMs = now;
   seenTouch = true;
-  bool wasSleeping = buddy.face == kSleepy;
-  buddy.until = now + reactionMs;
-  buddy.action = kFly;
-  buddy.anchorX = buddy.x;
-  buddy.anchorY = buddy.y;
-  kookerUntil = 0;
-  speech.visible = false;
-  placeTarget(rndRange(kMinX, kMaxX), rndRange(kMinY, kMinY + 50));
-  if (freshPet) {
-    buddy.face = kHappy;
-    buddy.caption = wasSleeping ? "waking up" : "enjoys that";
-    Serial.printf("pet enjoy face %u\n", buddy.face);
+  if (newTap) addStay(now);
+
+  // Already here: keep enjoying while the finger stays or taps again.
+  if (isHappy(now)) {
+    enjoyUntil = now + reactionMs;
+    buddy.until = enjoyUntil;
+    spawnHearts(now);
+    return;
   }
-  int spawned = 0;
-  for (int i = 0; i < kMotes && spawned < 2; ++i) {
-    if (motes[i].kind == 1 && motes[i].life > 0) continue;
-    if (motes[i].life > 30 && motes[i].kind == 0) continue;
-    spawnHeart(motes[i], buddy.x, buddy.y - 40);
-    spawned++;
+
+  if (buddy.action != kCome) {
+    const bool napping = buddy.face == kSleepy || buddy.action == kYawn;
+    const bool onScreen = buddy.x > 0 && buddy.x < W && buddy.y > 0 && buddy.y < H;
+    comeWalking = onScreen && (buddy.action == kWander || buddy.action == kGraze);
+    exploreStage = kExploreNone;
+    kookerUntil = 0;
+    speech.visible = false;
+    buddy.action = kCome;
+    buddy.anchorX = buddy.x;
+    buddy.anchorY = buddy.y;
+    buddy.until = now + 60000;  // ends on arrival (updateBuddy)
+    if (napping) {
+      buddy.face = kSleepy;
+      wakeUntil = now + 900;
+      buddy.caption = "waking up";
+    } else {
+      buddy.face = kNeutral;
+      wakeUntil = now;
+      buddy.caption = comeWalking ? "walking over" : "flying over";
+    }
+    Serial.printf("pet called, %s\n", buddy.caption);
   }
+  // Head for the touch; on foot he stays on the ground.
+  placeTarget(x, comeWalking ? kMaxY - 8 : y);
+  buddy.tz = 1.0f;  // comes right up close to you
 }
 
 void setup() {
@@ -991,6 +1274,7 @@ void setup() {
   rngState ^= micros();
   for (int i = 0; i < kMotes; ++i) spawnSpark(motes[i]);
 
+  buddy.z = buddy.tz = kGroundDepth;
   buddy.x = buddy.tx = buddy.anchorX = 240;
   buddy.y = buddy.ty = buddy.anchorY = 250;
   buddy.face = kNeutral;
@@ -998,14 +1282,9 @@ void setup() {
   buddy.caption = "soaring";
   buddy.until = 0;
 
-  bool displayOk = display.init();
-  display.setRotation(0);
-  display.setBrightness(255);
-  ledcDetach(38);
-  pinMode(38, OUTPUT);
-  digitalWrite(38, HIGH);
-  display.fillScreen(TFT_BLACK);
-  Serial.printf("display init %s, backlight forced on\n", displayOk ? "ok" : "FAILED");
+  const bool displayOk = panelBegin();
+  const bool touchOk = touchBegin();
+  Serial.printf("display init %s, touch %s\n", displayOk ? "ok" : "FAILED", touchOk ? "ok" : "FAILED");
 
   canvas.setPsram(true);
   canvas.setColorDepth(16);
@@ -1031,24 +1310,150 @@ void setup() {
     Serial.println(haveBackgrounds ? "card backgrounds ok" : "card backgrounds missing");
   }
   speech.visible = false;
+  menuBegin(&canvas);
   weatherBegin();
+}
+
+// Frame capture for pixel-exact screenshots. The header goes out at the normal
+// rate; the raw canvas (480x480, byte-swapped RGB565) at kDumpBaud in 1 KB
+// chunks, each followed by its Adler-32. The host answers 'A' (good) or 'R'
+// (resend). The USB serial bridge drops bytes at high rates, and this keeps a
+// single chunk in flight.
+static constexpr uint32_t kDumpBaud = 1000000;
+static constexpr size_t kDumpChunk = 1024;
+static bool shotPending = false;
+static int recordLeft = 0;
+static int recordEvery = 1;
+static int recordTick = 0;
+static uint32_t recordNow = 0;
+
+static uint32_t adler32(const uint8_t *p, size_t n) {
+  uint32_t a = 1, b = 0;
+  while (n--) {
+    a = (a + *p++) % 65521;
+    b = (b + a) % 65521;
+  }
+  return (b << 16) | a;
+}
+
+static void dumpCanvas() {
+  Serial.printf("SHOT %d %d\n", W, H);
+  Serial.flush();
+  Serial.updateBaudRate(kDumpBaud);
+  delay(300);  // time for the host to switch rates
+  while (Serial.available()) Serial.read();
+  const uint8_t *data = (const uint8_t *)canvas.getBuffer();
+  const size_t total = (size_t)W * H * 2;
+  for (size_t off = 0; off < total; off += kDumpChunk) {
+    const size_t len = total - off < kDumpChunk ? total - off : kDumpChunk;
+    const uint32_t sum = adler32(data + off, len);
+    for (int tries = 0; tries < 10; ++tries) {
+      Serial.write(data + off, len);
+      Serial.write((const uint8_t *)&sum, 4);
+      Serial.flush();
+      // Wait longer than the host's read timeout, so a resend never overlaps.
+      const uint32_t until = millis() + 2000;
+      int reply = -1;
+      while (reply < 0 && (int32_t)(millis() - until) < 0) reply = Serial.read();
+      if (reply == 'A') break;
+      delay(20);
+      while (Serial.available()) Serial.read();
+    }
+  }
+  delay(100);
+  Serial.updateBaudRate(115200);
+  delay(50);
 }
 
 void loop() {
   static uint32_t lastFrame = 0;
   uint32_t now = millis();
-  if (now - lastFrame < 33) return;
-  lastFrame = now;
+  if (recordLeft > 0) {
+    // Recording runs on its own clock so every frame is 33 ms apart, however
+    // long each dump takes.
+    recordNow += 33;
+    now = recordNow;
+  } else {
+    if (now - lastFrame < 33) return;
+    lastFrame = now;
+  }
 
-  pollTouch(now);
+  // Buttons act on the touch-down edge; petting continues while held.
+  static bool wasDown = false;
+  int tx = 0;
+  int ty = 0;
+  bool down = touchRead(&tx, &ty);
+  bool pressed = down && !wasDown;
+  wasDown = down;
+  // Serial test commands (see pickupandgo.md):
+  //   tap X Y      simulate a touch
+  //   act NAME     force the next behavior (nap soar soarup explore walk kooker graze)
+  //   shot         dump the current frame
+  //   rec N [K]    dump N frames on a fixed 33 ms clock, one every K ticks
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    int sx, sy, n;
+    if (sscanf(line.c_str(), "tap %d %d", &sx, &sy) == 2) {
+      tx = sx;
+      ty = sy;
+      pressed = true;
+      down = true;
+    } else if (line.startsWith("act ")) {
+      static const char *kNames[] = {"nap", "soar", "soarup", "explore", "walk", "kooker", "graze"};
+      const String name = line.substring(4);
+      for (int i = 0; i < 7; ++i) {
+        if (name == kNames[i]) {
+          forcedChoice = (int8_t)i;
+          buddy.until = now;  // pick it on this frame
+          wakeUntil = enjoyUntil = now;
+        }
+      }
+    } else if (line == "shot") {
+      shotPending = true;
+    } else if (sscanf(line.c_str(), "rec %d", &n) == 1 && n > 0) {
+      int k = 1;
+      sscanf(line.c_str(), "rec %*d %d", &k);
+      recordLeft = n;
+      recordEvery = k > 0 ? k : 1;
+      recordTick = 0;
+      recordNow = now;
+    }
+  }
+  if (pressed) Serial.printf("tap %d,%d\n", (int)tx, (int)ty);
+
+  if (menuIsOpen()) {
+    if (pressed) menuPress(tx, ty);
+    weatherTick(now);
+    if (!menuTick(now)) needFullRedraw = true;
+    if (shotPending) {
+      shotPending = false;
+      dumpCanvas();
+    }
+    return;
+  }
+  if (pressed && inMenuButton(tx, ty)) {
+    menuOpen();
+    menuTick(now);
+    return;
+  }
+
+  if (down) petTouch(now, tx, ty, pressed);
   updateBuddy(now);
   rollSpeech(now);
-  weatherTick(now);
+  if (recordLeft == 0) weatherTick(now);
   drawBuddy(now);
+  if (shotPending) {
+    shotPending = false;
+    dumpCanvas();
+  } else if (recordLeft > 0 && (recordTick++ % recordEvery) == 0) {
+    recordLeft--;
+    dumpCanvas();
+  }
+  panelWaitVsync(30);
+  const uint16_t *pixels = (const uint16_t *)canvas.getBuffer();
   for (int i = 0; i < pushCount; ++i) {
     const Box &b = pushBoxes[i];
-    display.setClipRect(b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0);
-    canvas.pushSprite(0, 0);
+    panelCopy(pixels, b.x0, b.y0, b.x1, b.y1);
   }
-  display.clearClipRect();
 }

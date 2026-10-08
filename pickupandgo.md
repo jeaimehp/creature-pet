@@ -5,18 +5,26 @@ Update this file as each step finishes.
 
 ## Status
 
-**Running.** The NO NAME card is in the TF slot. On 2026-10-07 at 9:20 PM the boot log showed all 18 sprites and all four landscapes loaded, `night.bin` included. A C920 photo showed the night scene in true color with napping Himop.
+**Running.** The NO NAME card is in the TF slot, and all 18 sprites and four landscapes load. The panel runs on ESP-IDF `esp_lcd` with bounce buffers and stays steady with Wi-Fi active. README screenshots are pixel-exact framebuffer dumps (`tools/capture.py`).
+
+Open items:
+- Real-finger touch has only been tested lightly; most testing used serial `tap`. If taps land in the wrong place, compare the `tap x,y` log lines with where you touched.
+- `sdcard/byte/sprites/12.bin` and `13.bin` in the repo have the wing-gap fix, but the card in the board still has the old files. The firmware fixes them at load, so copying is optional.
 
 Himop should:
 
 - Soar by cycling the six flying poses in `12.bin`–`17.bin`
 - Walk, rarely, by alternating the two step frames
-- Nap curled up with his eyes closed
+- Nap curled up with his eyes closed, only on screen (he walks back in first if away), and only after 5 minutes without a touch. Each nap lasts 30 minutes unless he's touched. He lies still, and a single "z" floats up.
+- Leave the screen on half of flights. Soaring can climb out the top; exploring heads out the left, right, or bottom. He lingers out of view for 1–3 s, then comes back in from any edge. Soaring moves 3.2 px/frame (`kSoarStep`), and trips off and back 4.5 px/frame (`kExploreStep`).
 - Nibble by biting leaves, chewing, then looking full
 - Roar “ROW, ROW, ROW” only when a kooker appears
-- Show the happy pose when tapped, and wake up first if he was napping
+- When tapped, come over to the touch (wake first if napping; walk if on the ground, otherwise fly), then show the happy pose and hearts. Taps keep him on screen: 30 s for the first, plus 10 s per extra tap, up to 5 min.
 - Show the current temperature and conditions, with no forecast
-- Show labels in the corners on dimmed see-through panels: clock with the date under it at top left, weather at top right, name with the caption under it at bottom left. The middle stays clear for Himop. The description is not shown.
+- Show a ☰ menu button in the lower-right corner. **Display** has checkboxes for Time, Date, Weather, Name, and Description (the activity line), saved in NVS key `show`. Wi-Fi settings: scan and pick a network, type a hidden one, and enter the password on an on-screen keyboard. Credentials are saved in NVS (namespace `himop`) and override `secrets.h`.
+- Show labels in the corners on dimmed see-through panels: clock with the date under it at top left, weather at top right, name with the caption under it at bottom left. The middle stays clear for Himop. `description=` from settings.txt is not shown.
+- Peek in from an edge while away, hold 2–4 s, and back out
+- Change size with depth: 0.5× far to 1.0× near
 - Use the landscape that matches the clock: morning 5:00–11:59, afternoon 12:00–4:59, evening 5:00–8:59, night otherwise
 
 ## Sprites
@@ -78,7 +86,7 @@ Timing to start with (the usual working set for this panel): PCLK 14 MHz, H/V po
 
 ## Approach
 
-PlatformIO Arduino project using LovyanGFX and its built-in `Panel_ST7701_guition_esp32_4848S040` panel. Draw the buddy into a 480×480 RGB565 sprite in PSRAM, then push that sprite each frame. Any touch counts as a pet, so touch rotation does not have to be perfect.
+PlatformIO Arduino project. `src/display_rgb.cpp` bit-bangs the ST7701 init over 3-wire SPI, the same sequence LovyanGFX sends, and runs the panel with ESP-IDF's `esp_lcd` RGB driver using two 20-line bounce buffers in internal SRAM. LovyanGFX draws into a 480×480 sprite in PSRAM, which is byte-swapped RGB565. The driver's data lanes are swapped (`i ^ 8`) so that sprite copies straight into the framebuffer. Each frame waits for vsync, then copies only the dirty boxes. GT911 touch uses LovyanGFX's `Touch_GT911` on its own.
 
 USB CDC stays off so GPIO 19 and GPIO 20 remain free for touch and the green data bus. The CH340 is the serial console.
 
@@ -106,6 +114,9 @@ TF card, after the display is up and CS 39 is held high: CS 42, MOSI 47, MISO 41
 - [x] Move the card into the TF slot and reboot so the poses and landscapes appear
 - [x] Fix washed-out pictures (byte order) and move the labels to the corners
 - [x] Stop the screen jumping (redraw and push only what changed)
+- [x] Wi-Fi menu button (scan, keyboard, NVS) and correct mid-tone colors (ST7701 back to RGB666)
+- [x] Steady panel (esp_lcd bounce buffers, vsync-timed copies, 12 MHz pixel clock)
+- [x] Naps only after 5 idle minutes (30-minute naps), off-screen exploring, display checkboxes
 
 ## Reflash later
 
@@ -116,6 +127,10 @@ pio run -t upload --upload-port /dev/tty.usbserial-12430
 pio device monitor --port /dev/tty.usbserial-12430 --baud 115200
 ```
 
+Serial test commands (115200 baud): `tap X Y` simulates a touch. `act NAME` forces the next behavior (`nap soar soarup explore walk kooker graze`). `shot` dumps the current frame. `rec N K` dumps N frames, one every K ticks of a fixed 33 ms clock. `tools/capture.py` drives these and writes PNGs and GIFs. Dumps switch the link to 1 Mbaud and send 1 KB chunks, each with an Adler-32 and an ACK/resend, because the CH340 link drops bytes at high rates (seen at 2 Mbaud).
+
+To test touch without a finger, send `tap X Y` over serial at 115200 and the firmware treats it as a tap. The menu button is at about `tap 450 450`, and "Choose network" is at `tap 240 282`. Opening the port resets the board, so wait about 14 seconds for boot.
+
 Serial is easiest to read with `~/.platformio/penv/bin/python` and pyserial. The system `python3` does not have pyserial installed. Take webcam photos with `imagesnap -d "HD Pro Webcam C920" -w 4 out.jpg`. The 4-second warm-up matters, because a shorter one gives a black frame.
 
 If upload cannot reset the board, hold BOOT, tap RESET, release BOOT, and run the upload again.
@@ -123,10 +138,10 @@ If upload cannot reset the board, hold BOOT, tap RESET, release BOOT, and run th
 ## If the picture is wrong
 
 - Blank screen: the backlight boost on GPIO 38 stays off if it is PWM'd around 20 kHz. Firmware now drives that pin high after init. A dark mirror in a photo means the backlight is still off.
-- Shifted or torn image: change H/V polarity or the back porches in `src/lgfx_board.hpp`.
+- Shifted or torn image: change H/V polarity or the back porches in `src/display_rgb.cpp`.
 - Washed out, or dark areas turned bright and speckled: the pixel bytes are reversed. Card `.bin` files are little-endian RGB565, but LovyanGFX 16-bit sprites store each pixel byte-swapped. `src/sd_store.cpp` swaps card pixels once when it loads them, and `blitHimop` swaps the built-in art. Raw pixels copied into `canvas` must be swapped.
-- Screen jumps, shifts, or shows doubled text: PSRAM is starved. LovyanGFX's `Bus_RGB` has the LCD DMA read the framebuffer straight from PSRAM with no bounce buffer, so heavy CPU PSRAM traffic makes it underrun. With a landscape loaded, `drawBuddy` restores only last frame's moving area (`dynBox`) plus any label whose text changed, and `loop` pushes only those boxes. Anything new that moves must call `markDirty`, or it leaves trails. Full-screen redraws now happen only when the landscape changes, and on the grid fallback.
-- Wrong colors: the 16 data wires are RGB565. The stock Guition init leaves the ST7701 in RGB666 (`0x3A` = `0x60`). Firmware now sends `0x50` instead. Do not switch that byte back.
+- Screen jumps, shifts, or shows doubled text: the panel DMA is underrunning. LovyanGFX's `Bus_RGB` read the framebuffer straight from PSRAM, and its vsync ISR restarted the DMA every frame, so PSRAM traffic from drawing or Wi-Fi (its buffers are in PSRAM) and late interrupts shifted the picture. Now the panel runs on `esp_lcd` with bounce buffers. If shifts come back, raise `kBounceLines` or lower `kPanelPclkHz`. With a landscape loaded, `drawBuddy` restores only last frame's moving area (`dynBox`) plus any label whose text changed, and `loop` pushes only those boxes. Anything new that moves must call `markDirty`, or it leaves trails. Full-screen redraws now happen only when the landscape changes, and on the grid fallback.
+- Wrong colors, where pure red, green, and blue look right but mid-tones are off (steel blue shows olive, maroon shows peach): the ST7701 pixel format is wrong. Keep `0x3A` = `0x60` (RGB666, the stock Guition value) in `src/board.hpp`. The board wires its 16 data lines for that mode. An earlier fix switched to `0x50` (RGB565) when the real problem was the byte order, and that scrambled the bits within each channel.
 - Touch feels ignored: any touch should still extend the happy timer. If none register, try GT911 address 0x14 and `offset_rotation`.
 
 ## Log
@@ -174,3 +189,23 @@ ROM reported flash mode DIO. That is what this platform writes for QIO boards, a
 - 2026-10-07: New layout. Clock and date are at top left, weather at top right, and name and caption at bottom left, each on a panel that dims the scene to a quarter, with a drop shadow on the text. Himop's flight band is now y 190–280. Flashed, and the photo confirms true color.
 - 2026-10-07: The screen was jumping. Cause: every frame copied the full 460 KB landscape and pushed the full 460 KB canvas, about 55 MB/s of PSRAM traffic. That starved the panel DMA, which reads the framebuffer from PSRAM. Now each frame restores and pushes only the box around Himop, his shadow, bubble, hearts, "z", and the kooker, plus labels whose text changed. Drifting sparks are off over landscapes, since they would dirty the whole screen. Himop now draws above the labels. A C920 clip at 6 fps showed no doubled labels or shifts; the only soft frames were camera refocus.
 - 2026-10-07: Added `README.md` with screen photos, the 18 sprites, the four landscapes, a flying-cycle GIF, and credit to Silas Rangel, who created Himop for his Creature Adventure Series. The images are in `docs/images/`. The sprite and landscape PNGs are converted from the card `.bin` files.
+- 2026-10-07: Added the ☰ Wi-Fi menu in the lower-right corner (`src/wifi_menu.cpp`). It has a main page (network, status, Choose network, Close), an async scan list (strongest first, padlock, signal bars, Back/Rescan/Other/More), and a keyboard (letters, shift, digits, symbols, del, Cancel, Save; "Next" when typing a hidden SSID). Credentials are saved in NVS and override `secrets.h`. Wi-Fi retries pause during a scan. Buttons act on touch-down; holding still pets Himop. Serial `tap X Y` simulates a tap.
+- 2026-10-07: A color test (pure primaries next to mid-tones) showed the mid-tones scrambled. Pure R/G/B were right, but (30,90,150) showed olive and (110,40,40) showed peach. Cause: `0x3A` = `0x50`. Back to `0x60` (stock RGB666), and every hue is now correct. The class is renamed `Panel_ST7701_guition_board`.
+- 2026-10-07: Fixed a spurious "wifi retry" right after reconnecting. The unsigned `now - gLastWifiTry` wrapped when connectWifi() stamped a later time than the tick's `now`.
+- 2026-10-07: Drove the menu end to end over serial taps and the C920. The scan found 2 networks, the keyboard typed, Cancel reconnected, and Close returned to Himop. Nothing was saved, so the board still uses `secrets.h`.
+- 2026-10-07: Still jittery. Measured with a script that records 30 fps, keeps Himop flying with serial taps, and counts frames where the static "Himop" label moves. At 14 MHz, 21 of 200 frames were shifted (worst error 47). At 12 MHz, 0 of 200. Kept 12 MHz.
+- 2026-10-07: Jitter reported even while napping, so it was not just drawing load. LovyanGFX's `Bus_RGB` restarts the DMA from its vsync ISR every frame and reads PSRAM directly. Wi-Fi buffers also live in PSRAM. Replaced it with `src/display_rgb.cpp`: `esp_lcd` RGB panel, 20-line bounce buffers, vsync semaphore, and copies right after vsync to avoid tearing. `lgfx_board.hpp` became `board.hpp` (pins, timing, init list). 40 s flying test: no shifted frames.
+- 2026-10-07: Tried aligning pose silhouettes so the body would hold still across the flying cycle. Whole-mask and body-only matching both looked worse than plain centering, because the art redraws the body in each pose. Removed it.
+- 2026-10-07: Naps now happen only after 5 minutes without a touch and last 30 minutes, with no bob and a smoothly rising "z". Otherwise he flies, walks, nibbles, or meets kookers. A third of flights explore off-screen and return (`exploreStage`). Seen on camera: off-screen about 8 s, then back from the right.
+- 2026-10-07: Added Display checkboxes (Time, Date, Weather, Name, Description) to the ☰ menu. Hidden labels take no space, so the others close up. Tested over serial taps with the C920: Weather and Description hidden, then restored.
+- 2026-10-07: Faster flight. Soaring went from 1.7 to 3.2 px/frame, and off-screen trips go 4.5 px/frame. Half of flights now explore off-screen (was a third), lingering 1–3 s (was 2–6 s).
+- 2026-10-07: Off-screen trips use all four edges. Trips: 3/6 normal soaring, 1/6 soaring up out the top, 2/6 exploring out the left, right, or bottom (`offscreenPoint`). He returns from a random edge.
+- 2026-10-07: A tap now calls Himop over (`kCome`) instead of making him instantly happy. Napping, he stays curled for 0.9 s ("waking up"). On the ground, he walks ("walking over", 1.8 px/frame). Otherwise he flies ("flying over", 4 px/frame, in from off-screen if needed) to the tap point. On arrival (`startEnjoying`) he shows the happy pose, hearts, and "enjoys that" for `hold_ms`. More touches while he's there extend it, with hearts at most every 250 ms. Checked on camera: called in from off-screen left, flew to the tap, then enjoyed it.
+- 2026-10-07: Peeking. While away on an off-screen trip (up to 2 per trip), he eases in from a random edge at 2 px/frame until about a third shows (`kPeekInset`), holds 2–4 s facing in, then backs out. Seen from the right and bottom edges.
+- 2026-10-07: Depth. `buddy.z` (0 far, 1 near) eases toward `tz` at 0.006/frame, and he draws at 0.5–1.0× scale (nearest neighbor), shadow too. New flight targets pick a random depth. Ground actions use 0.8, and a tap brings him to 1.0.
+- 2026-10-07: Black patch between the wings in flying poses 12 and 13: background enclosed by wing, antenna, and body was never cut out. `clearEnclosedGaps` (src/sd_store.cpp) clears near-black regions of at least 300 px that fill more than 40% of their box, plus two rim passes, when sprites load. Eye outlines are too sparse to match. The same fix was applied to `sdcard/byte/sprites/12.bin` and `13.bin` and the README PNGs/GIF, so the card can be refreshed later, but the firmware fix works with the card as it is.
+- 2026-10-07: Pixel-exact screenshots. Added serial `act`, `shot`, and `rec N K`, plus `tools/capture.py`. A pattern test at 2 Mbaud showed the CH340 link dropping bytes mid-stream (first loss at byte 2630), so dumps use 1 Mbaud, 1 KB chunks, Adler-32, and ACK/resend. The board waits 2 s for a reply and the host times out at 0.5 s, so resends never overlap. One 480×480 frame takes about 5 s. `rec` advances a fixed 33 ms clock per tick, so GIFs play at real speed. The "action" log line now includes the caption, and capture's `until TEXT` waits for it.
+- 2026-10-07: Bug found by the screenshots: a ground behavior (nap, nibble, walk, kooker) picked while he was off-screen or at an edge happened out of view or half cut off, since a nap doesn't move him. `pickNext` now flies him into the play area (`kMinX..kMaxX`, `kMinY..kMaxY`) first (`kExploreBack`) and keeps the choice in `forcedChoice` until he arrives.
+- 2026-10-07: Replaced the README webcam photos with pixel-exact stills (`docs/images/screens/`) and animations (`docs/images/anim/`).
+- 2026-10-07: Naps only on screen. If a nap comes due while he's off-screen, he starts at ground level just past a side edge and walks in ("walking back", 1.8 px/frame) to the play area, then naps. If he's on screen but outside the play area, he flies in first.
+- 2026-10-07: Petting keeps him on screen. The first tap sets `stayUntil` to 30 s, each further tap (new press) adds 10 s, capped at 5 min. While it runs, `rollChoice` turns off-screen trips (soar-up, explore) into plain soaring. Other behaviors continue.
